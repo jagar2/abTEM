@@ -1,0 +1,15 @@
+"""Dataerai platform integration: experiment preservation and provenance.
+
+See :mod:`abtem.dataerai.README` for the design overview. Public entry points
+are re-exported here; ``_``-prefixed modules are implementation details.
+"""
+
+from abtem.dataerai._config import DEFAULT_SERVER, DataeraiConfig, discover_token
+from abtem.dataerai._environment import environment_snapshot
+
+__all__ = [
+    "DEFAULT_SERVER",
+    "DataeraiConfig",
+    "discover_token",
+    "environment_snapshot",
+]
