@@ -33,6 +33,46 @@ def _sdk_available() -> bool:
         return False
 
 
+def _parse_token_material(text: str) -> Optional[str]:
+    """Extract a bearer token from raw credential material.
+
+    Credential stores hold either the bare token, a credentials JSON blob
+    (``access_token``/``token`` keys), or — for macOS ``security -w`` on
+    non-ASCII values — a hex encoding of either. A structured blob without
+    a usable token yields ``None`` rather than a garbage header.
+    """
+    text = text.strip()
+    if not text:
+        return None
+
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError:
+        pass
+    else:
+        if isinstance(payload, dict):
+            for key in ("access_token", "token"):
+                token = payload.get(key)
+                if isinstance(token, str) and token:
+                    return token
+            return None
+        return text
+
+    if (
+        len(text) >= 16
+        and len(text) % 2 == 0
+        and all(c in "0123456789abcdefABCDEF" for c in text)
+    ):
+        try:
+            decoded = bytes.fromhex(text).decode("utf-8")
+        except (ValueError, UnicodeDecodeError):
+            return text
+        if decoded.strip().startswith(("{", "[")):
+            return _parse_token_material(decoded)
+
+    return text
+
+
 def _keychain_token() -> Optional[str]:
     """Read the Dataerai OAuth token from the macOS Keychain, if present."""
     if sys.platform != "darwin":
@@ -48,8 +88,7 @@ def _keychain_token() -> Optional[str]:
         return None
     if result.returncode != 0:
         return None
-    token = result.stdout.strip()
-    return token or None
+    return _parse_token_material(result.stdout)
 
 
 def _default_credentials_path() -> Path:
@@ -65,22 +104,10 @@ def _credentials_file_token(path: Optional[Path] = None) -> Optional[str]:
     if path is None:
         path = _default_credentials_path()
     try:
-        content = Path(path).read_text().strip()
+        content = Path(path).read_text()
     except OSError:
         return None
-    if not content:
-        return None
-    try:
-        payload = json.loads(content)
-    except json.JSONDecodeError:
-        return content
-    if isinstance(payload, dict):
-        for key in ("access_token", "token"):
-            token = payload.get(key)
-            if isinstance(token, str) and token:
-                return token
-        return None
-    return content
+    return _parse_token_material(content)
 
 
 def discover_token(environ: Optional[Mapping[str, str]] = None) -> Optional[str]:

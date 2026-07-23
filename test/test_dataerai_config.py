@@ -150,6 +150,55 @@ class TestKeychainToken:
 
         assert _keychain_token() == "tok-from-keychain"
 
+    def test_json_blob_in_keychain(self, monkeypatch):
+        monkeypatch.setattr(sys, "platform", "darwin")
+        blob = json.dumps({"access_token": "tok-json", "refresh_token": "r"})
+
+        def fake_run(cmd, **kwargs):
+            return subprocess.CompletedProcess(cmd, 0, stdout=blob + "\n")
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+
+        assert _keychain_token() == "tok-json"
+
+    def test_hex_encoded_json_blob_in_keychain(self, monkeypatch):
+        # macOS `security -w` prints hex when the stored value is not
+        # plain ASCII; the daemon stores a credentials JSON blob.
+        monkeypatch.setattr(sys, "platform", "darwin")
+        blob = json.dumps({"access_token": "tok-hex", "user_email": "u@x.é"})
+        hex_blob = blob.encode("utf-8").hex()
+
+        def fake_run(cmd, **kwargs):
+            return subprocess.CompletedProcess(cmd, 0, stdout=hex_blob + "\n")
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+
+        assert _keychain_token() == "tok-hex"
+
+    def test_json_blob_without_token_yields_none(self, monkeypatch):
+        # a structured blob with no usable token must not be sent as a
+        # bearer header
+        monkeypatch.setattr(sys, "platform", "darwin")
+        blob = json.dumps({"refresh_token": "r", "user_email": "u@x"})
+
+        def fake_run(cmd, **kwargs):
+            return subprocess.CompletedProcess(cmd, 0, stdout=blob + "\n")
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+
+        assert _keychain_token() is None
+
+    def test_short_hexlike_token_kept_verbatim(self, monkeypatch):
+        # a real token that merely looks hex-ish must not be mangled
+        monkeypatch.setattr(sys, "platform", "darwin")
+
+        def fake_run(cmd, **kwargs):
+            return subprocess.CompletedProcess(cmd, 0, stdout="deadbeef\n")
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+
+        assert _keychain_token() == "deadbeef"
+
     def test_returns_none_off_darwin(self, monkeypatch):
         monkeypatch.setattr(sys, "platform", "linux")
 
