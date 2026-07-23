@@ -67,12 +67,16 @@ class Experiment:
         config: Optional[DataeraiConfig] = None,
         run_id: Optional[str] = None,
         autocapture: bool = True,
+        collection: Optional[str] = None,
     ):
         self.name = name or "abtem-experiment"
         self.run_id = run_id or (
             f"run-{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}"
         )
         self.config = config if config is not None else DataeraiConfig.from_env()
+        self.collection = collection or self.config.collection
+        self._collection_status: Optional[str] = None
+        self._collection_destination = None
         self.status = "running"
         self.started = datetime.now(timezone.utc).isoformat()
         self.finished: Optional[str] = None
@@ -329,6 +333,8 @@ class Experiment:
                 "project_id": self.config.project_id,
                 "owner_type": self.config.owner_type,
                 "dry_run": self.config.dry_run,
+                "collection": self.collection,
+                "collection_status": self._collection_status,
             },
             "environment": self.graph.nodes[self._experiment_key].record["environment"],
             "components": {
@@ -357,7 +363,37 @@ class Experiment:
             ):
                 node.record["payload_sha256"] = tree_sha256(node.payload_path)
 
+    def _resolve_collection(self) -> None:
+        """Resolve the configured collection path into a filing destination."""
+        if not self.collection or self.config.dry_run:
+            return
+        destination, detail = self._client.resolve_collection(self.collection)
+        if destination is None:
+            self._collection_status = f"failed: {detail}"
+            logger.warning(
+                "dataerai run %s: could not resolve collection %r (%s); "
+                "uploading without a collection",
+                self.run_id,
+                self.collection,
+                detail,
+            )
+        else:
+            self._collection_destination = destination
+            self._collection_status = "resolved"
+
     def _deliver(self) -> None:
+        self._resolve_collection()
+        destination = self._collection_destination
+        filing = (
+            {
+                "collection_id": destination.collection_id,
+                "owner_type": "project",
+                "owner_id": destination.project_id,
+            }
+            if destination is not None
+            else {}
+        )
+
         for key, node in self.graph.nodes.items():
             if node.payload_path is None or not node.payload_path.exists():
                 node.upload_status = "skipped"
@@ -379,6 +415,7 @@ class Experiment:
                     "record": json_safe(node.record),
                 },
                 description=f"abTEM experiment run {self.run_id}",
+                **filing,
             )
             node.upload_status = outcome.status
             node.upload_detail = outcome.detail
@@ -526,6 +563,7 @@ def track(
     config: Optional[DataeraiConfig] = None,
     run_id: Optional[str] = None,
     autocapture: bool = True,
+    collection: Optional[str] = None,
 ):
     """Open a tracked experiment; finalize (upload, link, manifest) on exit.
 
@@ -541,6 +579,10 @@ def track(
         Explicit run identifier (generated when omitted).
     autocapture : bool
         Capture every ``to_zarr`` save automatically while active.
+    collection : str, optional
+        ``Project/Collection/...`` path to file uploaded assets under
+        (created if missing, project included). Defaults to
+        ``DATAERAI_COLLECTION``; assets are then owned by that project.
     """
     global _ACTIVE
     if _ACTIVE is not None:
@@ -554,6 +596,7 @@ def track(
         config=config,
         run_id=run_id,
         autocapture=autocapture,
+        collection=collection,
     )
     _ACTIVE = experiment
     _install_autocapture()

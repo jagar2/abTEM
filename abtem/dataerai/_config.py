@@ -154,6 +154,7 @@ class DataeraiConfig:
     project_id: Optional[str] = None
     owner_type: str = "project"
     dry_run: bool = True
+    collection: Optional[str] = None
     token: Optional[str] = field(default=None, repr=False)
 
     def __post_init__(self):
@@ -191,5 +192,6 @@ class DataeraiConfig:
             project_id=environ.get("DATAERAI_PROJECT_ID") or None,
             owner_type=environ.get("DATAERAI_OWNER_TYPE", "project"),
             dry_run=dry_run,
+            collection=environ.get("DATAERAI_COLLECTION") or None,
             token=token,
         )

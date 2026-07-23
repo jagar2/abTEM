@@ -49,6 +49,16 @@ class TestFromEnv:
         assert config.project_id == "6f2a2c1e-aaaa-bbbb-cccc-000000000001"
         assert config.owner_type == "user"
 
+    def test_collection_from_env(self, no_ambient_credentials):
+        config = DataeraiConfig.from_env(
+            environ={"DATAERAI_COLLECTION": "Microscopy/abTEM runs"}
+        )
+
+        assert config.collection == "Microscopy/abTEM runs"
+
+    def test_collection_default_none(self, no_ambient_credentials):
+        assert DataeraiConfig.from_env(environ={}).collection is None
+
     def test_token_from_env_enables_live_mode(self, no_ambient_credentials):
         config = DataeraiConfig.from_env(environ={"DATAERAI_TOKEN": "tok-123"})
 

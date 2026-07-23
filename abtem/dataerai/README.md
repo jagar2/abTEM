@@ -126,9 +126,19 @@ using the asset ids stored in the manifest — nothing is re-uploaded.
 | `DATAERAI_SERVER`           | server base URL for the REST fallback (default `https://beta.dataerai.com`) |
 | `DATAERAI_PROJECT_ID`       | project UUID that owns the created assets        |
 | `DATAERAI_OWNER_TYPE`       | `project` (default) or `user`                    |
+| `DATAERAI_COLLECTION`       | `Project/Collection/...` path to file uploads under (created if missing) |
 | `DATAERAI_DRY_RUN`          | `1` forces offline mode, `0` forces live mode    |
 | `DATAERAI_TOKEN`            | bearer token override for the REST fallback      |
 | `DATAERAI_CREDENTIALS_FILE` | alternative credentials file location            |
+
+Without a collection, uploads land as loose assets (findable by tag and
+deep link, but not in the Browse tree). Passing
+`track(..., collection="Microscopy/abTEM runs")` — or setting
+`DATAERAI_COLLECTION` — resolves that project-rooted path (creating missing
+containers), files every uploaded asset into the collection, and owns them
+by that project. The manifest records the path and whether resolution
+succeeded; a failed resolution degrades to loose uploads rather than
+blocking delivery.
 
 Install the optional dependency with `pip install "abTEM[dataerai]"`; the SDK
 uploads through the local `dataerai-transfer` daemon (`dataerai auth login`

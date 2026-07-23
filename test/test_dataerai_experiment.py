@@ -322,6 +322,7 @@ class FakeSdkClient:
     def __init__(self, *args, **kwargs):
         self.uploads = []
         self.relationships = []
+        self.collection_paths = []
         self.connected = False
         self.closed = False
         self._counter = 0
@@ -353,6 +354,23 @@ class FakeSdkClient:
         self.relationships.append((from_asset_id, to_asset_id, rel_type, kwargs))
         return types.SimpleNamespace(id="rel", type=rel_type)
 
+    collection_error = None
+
+    def ensure_collection_path(self, path, *, create_project=False, **kwargs):
+        self._require_connected()
+        if FakeSdkClient.collection_error is not None:
+            raise FakeSdkClient.collection_error
+        self.collection_paths.append((path, create_project))
+        return FakeDestination()
+
+
+@dataclass
+class FakeDestination:
+    path: str = "Microscopy/abTEM"
+    project_id: str = "70707070-0000-0000-0000-000000000001"
+    project_name: str = "Microscopy"
+    collection_id: str = "80808080-0000-0000-0000-000000000002"
+
 
 @pytest.fixture
 def fake_sdk(monkeypatch):
@@ -360,6 +378,7 @@ def fake_sdk(monkeypatch):
     module.DataeraiClient = FakeSdkClient
     monkeypatch.setitem(sys.modules, "dataerai", module)
     FakeSdkClient.instances = []
+    FakeSdkClient.collection_error = None
     yield module
 
 
@@ -412,6 +431,66 @@ class TestLiveFinalize:
             experiment.capture_structure(atoms)
 
         assert FakeSdkClient.instances[0].closed is True
+
+    def test_collection_files_uploads(self, tmp_path, atoms, fake_sdk):
+        config = DataeraiConfig(dry_run=False)
+
+        with track(
+            directory=tmp_path,
+            config=config,
+            run_id="r1",
+            collection="Microscopy/abTEM",
+        ) as experiment:
+            experiment.capture_structure(atoms)
+
+        manifest = read_manifest(tmp_path, "r1")
+        assert manifest["config"]["collection"] == "Microscopy/abTEM"
+        assert manifest["config"]["collection_status"] == "resolved"
+
+        sdk = FakeSdkClient.instances[0]
+        assert sdk.collection_paths == [("Microscopy/abTEM", True)]
+        for _, kwargs in sdk.uploads:
+            assert kwargs["collection_id"] == FakeDestination.collection_id
+            assert kwargs["owner_type"] == "project"
+            assert kwargs["owner_id"] == FakeDestination.project_id
+
+    def test_collection_from_config_env(self, tmp_path, atoms, fake_sdk):
+        config = DataeraiConfig(dry_run=False, collection="Env/Runs")
+
+        with track(directory=tmp_path, config=config, run_id="r1") as experiment:
+            experiment.capture_structure(atoms)
+
+        manifest = read_manifest(tmp_path, "r1")
+        assert manifest["config"]["collection"] == "Env/Runs"
+        assert FakeSdkClient.instances[0].collection_paths == [("Env/Runs", True)]
+
+    def test_collection_failure_still_uploads(self, tmp_path, atoms, fake_sdk):
+        FakeSdkClient.collection_error = RuntimeError("no such project")
+        config = DataeraiConfig(dry_run=False)
+
+        with track(
+            directory=tmp_path, config=config, run_id="r1", collection="X/Y"
+        ) as experiment:
+            experiment.capture_structure(atoms)
+
+        manifest = read_manifest(tmp_path, "r1")
+        assert "no such project" in manifest["config"]["collection_status"]
+        for node in manifest["nodes"].values():
+            assert node["upload_status"] == "uploaded"
+        for _, kwargs in FakeSdkClient.instances[0].uploads:
+            assert kwargs.get("collection_id") is None
+
+    def test_dry_run_records_collection_without_resolving(self, tmp_path, atoms):
+        with track(
+            directory=tmp_path,
+            config=DataeraiConfig(dry_run=True, collection="A/B"),
+            run_id="r1",
+        ) as experiment:
+            experiment.capture_structure(atoms)
+
+        manifest = read_manifest(tmp_path, "r1")
+        assert manifest["config"]["collection"] == "A/B"
+        assert manifest["config"]["collection_status"] is None
 
     def test_deferred_write_skipped(self, tmp_path, images, fake_sdk):
         config = DataeraiConfig(dry_run=False)

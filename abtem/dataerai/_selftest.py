@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Union
+from typing import Optional, Union
 
 from abtem.dataerai._config import DataeraiConfig
 from abtem.dataerai._experiment import track
@@ -12,14 +12,17 @@ __all__ = ["selftest"]
 
 
 def selftest(
-    directory: Union[str, Path] = "dataerai-selftest", live: bool = False
+    directory: Union[str, Path] = "dataerai-selftest",
+    live: bool = False,
+    collection: Optional[str] = None,
 ) -> Path:
     """Run a miniature annular-dark-field STEM experiment through
     :func:`~abtem.dataerai.track` and return the run directory.
 
     By default the run is forced into dry-run mode so it works without the
     SDK, daemon, or credentials; pass ``live=True`` to deliver to a real
-    server using the ambient configuration.
+    server using the ambient configuration, optionally filing the assets
+    under a ``Project/Collection`` path.
     """
     import ase.build
 
@@ -30,7 +33,10 @@ def selftest(
     atoms = ase.build.bulk("Si", cubic=True)
 
     with track(
-        name="dataerai-selftest", directory=directory, config=config
+        name="dataerai-selftest",
+        directory=directory,
+        config=config,
+        collection=collection,
     ) as experiment:
         experiment.capture_structure(atoms)
 

@@ -129,6 +129,33 @@ class PreservationClient:
                 self._owner = ("user", status.user_id)
         return self._owner
 
+    def resolve_collection(
+        self, path: str, *, create_project: bool = True
+    ) -> tuple[Any, Optional[str]]:
+        """Resolve a ``Project/Collection/...`` path to a destination.
+
+        Returns ``(destination, error_detail)`` with exactly one set; the
+        destination carries ``project_id`` and ``collection_id`` for filing
+        uploads. Missing containers are created (including the project when
+        ``create_project`` is true).
+        """
+        if self._config.dry_run:
+            return None, "dry-run"
+
+        sdk_client, detail = self._ensure_sdk()
+        if sdk_client is None:
+            return None, detail
+
+        ensure = getattr(sdk_client, "ensure_collection_path", None)
+        if not callable(ensure):
+            return None, "SDK does not support collection paths"
+
+        try:
+            destination = ensure(path, create_project=create_project)
+        except Exception as error:
+            return None, str(error)
+        return destination, None
+
     def upload(
         self,
         path: Union[str, Path],
@@ -138,8 +165,15 @@ class PreservationClient:
         tags: Optional[list] = None,
         metadata: Optional[dict] = None,
         description: Optional[str] = None,
+        collection_id: Optional[str] = None,
+        owner_type: Optional[str] = None,
+        owner_id: Optional[str] = None,
     ) -> UploadOutcome:
-        """Preserve one artifact file as a Dataerai asset."""
+        """Preserve one artifact file as a Dataerai asset.
+
+        Without an explicit ``owner_type``/``owner_id`` the owner is the
+        configured project, else the authenticated daemon user.
+        """
         if self._config.dry_run:
             return UploadOutcome(status="skipped", detail="dry-run")
 
@@ -149,7 +183,8 @@ class PreservationClient:
             return UploadOutcome(status=status, detail=detail)
 
         try:
-            owner_type, owner_id = self._resolve_owner(sdk_client)
+            if owner_type is None or owner_id is None:
+                owner_type, owner_id = self._resolve_owner(sdk_client)
             result = sdk_client.upload(
                 str(path),
                 title=title,
@@ -159,6 +194,7 @@ class PreservationClient:
                 tags=tags,
                 metadata=metadata,
                 description=description,
+                collection_id=collection_id,
             )
         except Exception as error:
             return UploadOutcome(status="failed", detail=str(error))

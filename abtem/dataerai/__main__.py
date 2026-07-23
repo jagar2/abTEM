@@ -43,6 +43,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         help="deliver to a real server using ambient credentials "
         "instead of forcing dry-run",
     )
+    selftest_parser.add_argument(
+        "--collection",
+        default=None,
+        help="Project/Collection path to file uploaded assets under "
+        "(created if missing)",
+    )
 
     relink_parser = subparsers.add_parser(
         "relink",
@@ -62,7 +68,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print(f"relink {manifest['run_id']}: {summary}")
         return 0 if failed == 0 else 1
 
-    run_dir = selftest(directory=args.directory, live=args.live)
+    run_dir = selftest(
+        directory=args.directory, live=args.live, collection=args.collection
+    )
     manifest = json.loads((run_dir / "provenance_manifest.json").read_text())
 
     uploads = [node["upload_status"] for node in manifest["nodes"].values()]

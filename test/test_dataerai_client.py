@@ -49,11 +49,14 @@ class FakeClient:
     relationship_error: Optional[Exception] = None
     auth_error: Optional[Exception] = None
     connect_error: Optional[Exception] = None
+    collection_error: Optional[Exception] = None
+    collection_destination = None
     instances: list = []
 
     def __init__(self, *args, **kwargs):
         self.uploads = []
         self.relationships = []
+        self.collection_paths = []
         self.connected = False
         self.closed = False
         FakeClient.instances.append(self)
@@ -91,6 +94,13 @@ class FakeClient:
         self.relationships.append((from_asset_id, to_asset_id, rel_type, kwargs))
         return types.SimpleNamespace(id="rel-1", type=rel_type)
 
+    def ensure_collection_path(self, path, *, create_project=False, **kwargs):
+        self._require_connected()
+        if FakeClient.collection_error is not None:
+            raise FakeClient.collection_error
+        self.collection_paths.append((path, create_project))
+        return FakeClient.collection_destination
+
 
 @pytest.fixture
 def fake_sdk(monkeypatch):
@@ -103,6 +113,8 @@ def fake_sdk(monkeypatch):
     FakeClient.relationship_error = None
     FakeClient.auth_error = None
     FakeClient.connect_error = None
+    FakeClient.collection_error = None
+    FakeClient.collection_destination = None
     yield module
 
 
@@ -386,6 +398,77 @@ class TestLink:
         outcome = client.link(self.FROM, self.TO, "derived_from")
 
         assert outcome.status == "skipped"
+
+
+@dataclass
+class FakeCollectionDestination:
+    path: str = "Proj/Sub"
+    project_id: str = "12341234-0000-0000-0000-000000000009"
+    project_name: str = "Proj"
+    collection_id: str = "43214321-0000-0000-0000-000000000007"
+
+
+class TestResolveCollection:
+    def test_dry_run_skips(self, no_sdk):
+        client = PreservationClient(DataeraiConfig(dry_run=True))
+
+        destination, detail = client.resolve_collection("Proj/Sub")
+
+        assert destination is None
+        assert detail == "dry-run"
+
+    def test_resolves_via_sdk(self, fake_sdk):
+        FakeClient.collection_destination = FakeCollectionDestination()
+        client = PreservationClient(live_config())
+
+        destination, detail = client.resolve_collection("Proj/Sub")
+
+        assert detail is None
+        assert destination.collection_id == (
+            FakeCollectionDestination.collection_id
+        )
+        assert FakeClient.instances[0].collection_paths == [("Proj/Sub", True)]
+
+    def test_old_sdk_without_support(self, monkeypatch):
+        class OldClient:
+            def __init__(self, *args, **kwargs):
+                pass
+
+        module = types.ModuleType("dataerai")
+        module.DataeraiClient = OldClient
+        monkeypatch.setitem(sys.modules, "dataerai", module)
+        client = PreservationClient(live_config())
+
+        destination, detail = client.resolve_collection("Proj/Sub")
+
+        assert destination is None
+        assert "collection" in detail
+
+    def test_resolution_failure_reported(self, fake_sdk):
+        FakeClient.collection_error = RuntimeError("permission denied on project")
+        client = PreservationClient(live_config())
+
+        destination, detail = client.resolve_collection("Proj/Sub")
+
+        assert destination is None
+        assert "permission denied" in detail
+
+    def test_upload_carries_collection_and_owner_override(self, fake_sdk, payload):
+        client = PreservationClient(live_config())
+
+        outcome = client.upload(
+            payload,
+            title="t",
+            collection_id="43214321-0000-0000-0000-000000000007",
+            owner_type="project",
+            owner_id="12341234-0000-0000-0000-000000000009",
+        )
+
+        assert outcome.status == "uploaded"
+        (_, kwargs) = FakeClient.instances[0].uploads[0]
+        assert kwargs["collection_id"] == "43214321-0000-0000-0000-000000000007"
+        assert kwargs["owner_type"] == "project"
+        assert kwargs["owner_id"] == "12341234-0000-0000-0000-000000000009"
 
 
 class TestPostJson:
