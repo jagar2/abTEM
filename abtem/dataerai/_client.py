@@ -74,18 +74,50 @@ class PreservationClient:
     def __init__(self, config: DataeraiConfig):
         self._config = config
         self._sdk_client: Any = None
+        self._sdk_state = "untried"  # "untried" | "ready" | "missing" | "broken"
+        self._sdk_error: Optional[str] = None
         self._owner: Optional[tuple[str, str]] = None
 
-    def _get_sdk_client(self):
-        """Import the SDK and build a client once; None if unavailable."""
-        if self._sdk_client is None:
+    def _ensure_sdk(self) -> tuple[Any, Optional[str]]:
+        """Import the SDK, build a client, and connect it, once.
+
+        Published SDKs require an explicit ``connect()`` before requests;
+        older generations connect implicitly, so the call is made only when
+        the method exists. Returns ``(client, error_detail)`` with exactly
+        one of the two set.
+        """
+        if self._sdk_state == "untried":
             try:
                 from dataerai import DataeraiClient
             except ImportError:
-                self._sdk_client = False
+                self._sdk_state = "missing"
+                self._sdk_error = "dataerai SDK not installed"
             else:
-                self._sdk_client = DataeraiClient()
-        return self._sdk_client or None
+                try:
+                    client = DataeraiClient()
+                    connect = getattr(client, "connect", None)
+                    if callable(connect):
+                        connect()
+                except Exception as error:
+                    self._sdk_state = "broken"
+                    self._sdk_error = str(error)
+                else:
+                    self._sdk_state = "ready"
+                    self._sdk_client = client
+        return self._sdk_client, self._sdk_error
+
+    def close(self) -> None:
+        """Release the SDK client (and its daemon connection), if any."""
+        client, self._sdk_client = self._sdk_client, None
+        self._sdk_state = "untried"
+        self._sdk_error = None
+        if client is not None:
+            close = getattr(client, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception:  # closing is best-effort
+                    pass
 
     def _resolve_owner(self, sdk_client) -> tuple[str, str]:
         """Owner for new assets: the configured project, else the daemon user."""
@@ -111,9 +143,10 @@ class PreservationClient:
         if self._config.dry_run:
             return UploadOutcome(status="skipped", detail="dry-run")
 
-        sdk_client = self._get_sdk_client()
+        sdk_client, detail = self._ensure_sdk()
         if sdk_client is None:
-            return UploadOutcome(status="skipped", detail="dataerai SDK not installed")
+            status = "skipped" if self._sdk_state == "missing" else "failed"
+            return UploadOutcome(status=status, detail=detail)
 
         try:
             owner_type, owner_id = self._resolve_owner(sdk_client)
@@ -146,7 +179,7 @@ class PreservationClient:
         if self._config.dry_run:
             return LinkOutcome(status="skipped", detail="dry-run")
 
-        sdk_client = self._get_sdk_client()
+        sdk_client, detail = self._ensure_sdk()
         if sdk_client is not None and hasattr(sdk_client, "create_relationship"):
             return self._link_via_sdk(
                 sdk_client,
@@ -168,6 +201,8 @@ class PreservationClient:
                 qualifier_note=qualifier_note,
             )
 
+        if self._sdk_state == "broken":
+            return LinkOutcome(status="failed", detail=detail)
         return LinkOutcome(
             status="skipped",
             detail="no SDK create_relationship and no bearer token",

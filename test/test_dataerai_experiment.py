@@ -315,23 +315,41 @@ class FakeUploadResult:
 
 
 class FakeSdkClient:
+    """Mirrors the published SDK: connect() required, close() expected."""
+
     instances = []
 
     def __init__(self, *args, **kwargs):
         self.uploads = []
         self.relationships = []
+        self.connected = False
+        self.closed = False
         self._counter = 0
         FakeSdkClient.instances.append(self)
 
+    def connect(self):
+        self.connected = True
+
+    def close(self):
+        self.connected = False
+        self.closed = True
+
+    def _require_connected(self):
+        if not self.connected:
+            raise RuntimeError("Not connected — call connect() first")
+
     def auth_status(self):
+        self._require_connected()
         return types.SimpleNamespace(user_id="u-1")
 
     def upload(self, local_path, **kwargs):
+        self._require_connected()
         self._counter += 1
         self.uploads.append((local_path, kwargs))
         return FakeUploadResult(asset_id=f"00000000-0000-0000-0000-{self._counter:012d}")
 
     def create_relationship(self, from_asset_id, to_asset_id, rel_type, **kwargs):
+        self._require_connected()
         self.relationships.append((from_asset_id, to_asset_id, rel_type, kwargs))
         return types.SimpleNamespace(id="rel", type=rel_type)
 
@@ -386,6 +404,14 @@ class TestLiveFinalize:
             assert "abtem-run:r7" in kwargs["tags"]
             assert kwargs["metadata"]["run_id"] == "r7"
             assert kwargs["metadata"]["abtem_version"] == abtem.__version__
+
+    def test_sdk_client_closed_after_finalize(self, tmp_path, atoms, fake_sdk):
+        config = DataeraiConfig(dry_run=False)
+
+        with track(directory=tmp_path, config=config, run_id="r1") as experiment:
+            experiment.capture_structure(atoms)
+
+        assert FakeSdkClient.instances[0].closed is True
 
     def test_deferred_write_skipped(self, tmp_path, images, fake_sdk):
         config = DataeraiConfig(dry_run=False)

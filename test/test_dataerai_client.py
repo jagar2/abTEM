@@ -39,30 +39,53 @@ class FakeDaemonError(Exception):
 
 
 class FakeClient:
-    """Stands in for dataerai.DataeraiClient; records calls."""
+    """Stands in for dataerai.DataeraiClient; records calls.
+
+    Mirrors the published SDK contract: requests fail until ``connect()``
+    is called.
+    """
 
     upload_error: Optional[Exception] = None
     relationship_error: Optional[Exception] = None
     auth_error: Optional[Exception] = None
+    connect_error: Optional[Exception] = None
     instances: list = []
 
     def __init__(self, *args, **kwargs):
         self.uploads = []
         self.relationships = []
+        self.connected = False
+        self.closed = False
         FakeClient.instances.append(self)
 
+    def connect(self):
+        if FakeClient.connect_error is not None:
+            raise FakeClient.connect_error
+        self.connected = True
+
+    def close(self):
+        self.connected = False
+        self.closed = True
+
+    def _require_connected(self):
+        if not self.connected:
+            raise RuntimeError("Not connected — call connect() first")
+
     def auth_status(self):
+        self._require_connected()
         if FakeClient.auth_error is not None:
             raise FakeClient.auth_error
         return FakeAuthStatus()
 
     def upload(self, local_path, **kwargs):
+        self._require_connected()
         if FakeClient.upload_error is not None:
             raise FakeClient.upload_error
         self.uploads.append((local_path, kwargs))
         return FakeUploadResult()
 
     def create_relationship(self, from_asset_id, to_asset_id, rel_type, **kwargs):
+        self._require_connected()
         if FakeClient.relationship_error is not None:
             raise FakeClient.relationship_error
         self.relationships.append((from_asset_id, to_asset_id, rel_type, kwargs))
@@ -79,6 +102,7 @@ def fake_sdk(monkeypatch):
     FakeClient.upload_error = None
     FakeClient.relationship_error = None
     FakeClient.auth_error = None
+    FakeClient.connect_error = None
     yield module
 
 
@@ -177,6 +201,60 @@ class TestUpload:
         # one client instance, one auth_status round-trip, two uploads
         assert len(FakeClient.instances) == 1
         assert len(FakeClient.instances[0].uploads) == 2
+
+    def test_connects_published_sdk_before_use(self, fake_sdk, payload):
+        client = PreservationClient(live_config())
+
+        outcome = client.upload(payload, title="t")
+
+        assert outcome.status == "uploaded"
+        assert FakeClient.instances[0].connected is True
+
+    def test_connect_failure_degrades(self, fake_sdk, payload):
+        FakeClient.connect_error = RuntimeError("daemon unreachable")
+        client = PreservationClient(live_config())
+
+        outcome = client.upload(payload, title="t")
+
+        assert outcome.status == "failed"
+        assert "daemon unreachable" in outcome.detail
+        # and stays failed (no crash) on subsequent calls
+        assert client.upload(payload, title="t2").status == "failed"
+
+    def test_close_closes_sdk_client(self, fake_sdk, payload):
+        client = PreservationClient(live_config())
+        client.upload(payload, title="t")
+
+        client.close()
+
+        assert FakeClient.instances[0].closed is True
+
+    def test_close_without_sdk_is_safe(self, no_sdk):
+        client = PreservationClient(live_config())
+
+        client.close()  # must not raise
+
+    def test_sdk_without_connect_still_works(self, monkeypatch, payload):
+        class EagerClient:  # SDK generation that connects implicitly, no close()
+            def __init__(self, *args, **kwargs):
+                self.uploads = []
+
+            def auth_status(self):
+                return FakeAuthStatus()
+
+            def upload(self, local_path, **kwargs):
+                self.uploads.append((local_path, kwargs))
+                return FakeUploadResult()
+
+        module = types.ModuleType("dataerai")
+        module.DataeraiClient = EagerClient
+        monkeypatch.setitem(sys.modules, "dataerai", module)
+        client = PreservationClient(live_config())
+
+        outcome = client.upload(payload, title="t")
+
+        assert outcome.status == "uploaded"
+        client.close()  # no close() on the SDK client: still safe
 
 
 class TestLink:

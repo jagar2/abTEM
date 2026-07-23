@@ -306,6 +306,7 @@ class Experiment:
             self._hash_pending_payloads()
             self._deliver()
         finally:
+            self._client.close()
             self._write_manifest()
             logger.info(
                 "dataerai run %s finalized (%s): %d artifacts, %d edges -> %s",
