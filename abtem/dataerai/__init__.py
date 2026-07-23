@@ -6,10 +6,20 @@ are re-exported here; ``_``-prefixed modules are implementation details.
 
 from abtem.dataerai._config import DEFAULT_SERVER, DataeraiConfig, discover_token
 from abtem.dataerai._environment import environment_snapshot
+from abtem.dataerai._experiment import (
+    Experiment,
+    capture,
+    current_experiment,
+    track,
+)
 
 __all__ = [
     "DEFAULT_SERVER",
     "DataeraiConfig",
+    "Experiment",
+    "capture",
+    "current_experiment",
     "discover_token",
     "environment_snapshot",
+    "track",
 ]
