@@ -114,6 +114,11 @@ Every payload carries a SHA-256 content hash in the manifest.
 A failed experiment (an exception inside `track()`) still finalizes: the
 manifest is written with `"status": "failed"` and the exception re-raised.
 
+Because uploads and edges deliver separately, a transient failure can leave
+preserved assets without their relationships. `python -m abtem.dataerai
+relink <run-dir>` replays every edge that is not yet `created`/`exists`
+using the asset ids stored in the manifest — nothing is re-uploaded.
+
 ## Configuration
 
 | environment variable        | meaning                                          |
