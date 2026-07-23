@@ -39,9 +39,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     run_dir = selftest(directory=args.directory, live=args.live)
     manifest = json.loads((run_dir / "provenance_manifest.json").read_text())
 
-    uploads = [
-        node["upload_status"] for node in manifest["nodes"].values()
-    ]
+    uploads = [node["upload_status"] for node in manifest["nodes"].values()]
     print(
         f"selftest {manifest['status']}: {len(manifest['nodes'])} artifacts "
         f"({uploads.count('uploaded')} uploaded, {uploads.count('skipped')} "

@@ -113,9 +113,7 @@ class PreservationClient:
 
         sdk_client = self._get_sdk_client()
         if sdk_client is None:
-            return UploadOutcome(
-                status="skipped", detail="dataerai SDK not installed"
-            )
+            return UploadOutcome(status="skipped", detail="dataerai SDK not installed")
 
         try:
             owner_type, owner_id = self._resolve_owner(sdk_client)
@@ -196,9 +194,7 @@ class PreservationClient:
                 qualifier_note=qualifier_note,
             )
         except Exception as error:
-            if "ERR_RELATIONSHIP_EXISTS" in (
-                getattr(error, "code", "") or str(error)
-            ):
+            if "ERR_RELATIONSHIP_EXISTS" in (getattr(error, "code", "") or str(error)):
                 return LinkOutcome(status="exists")
             return LinkOutcome(status="failed", detail=str(error))
         return LinkOutcome(status="created")

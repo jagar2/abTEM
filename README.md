@@ -40,6 +40,16 @@ our [walkthrough](https://abtem.github.io/doc/user_guide/walkthrough/walkthrough
 
 For a pedagogical guide into numerical transmission electron microscopy simulations with extensive use of *ab*TEM code, please see [this computational article](https://www.elementalmicroscopy.com/articles/EM000005).
 
+## Experiment provenance (Dataerai)
+
+This fork adds `abtem.dataerai`: full experiment provenance for abTEM
+simulations. Within a `dataerai.track(...)` context, structures, potentials,
+probes, scans, detectors, and computed measurements are preserved as linked
+[Dataerai](https://dataerai.com) assets forming a provenance graph, with a
+local JSON manifest and mermaid report always written (offline-safe dry-run
+mode included). See [abtem/dataerai/README.md](abtem/dataerai/README.md), or
+run `python -m abtem.dataerai selftest`.
+
 ## Citing *ab*TEM
 
 If you find *ab*TEM useful in your research, please cite our methods article:

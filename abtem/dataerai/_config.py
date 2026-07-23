@@ -54,7 +54,9 @@ def _keychain_token() -> Optional[str]:
 
 def _default_credentials_path() -> Path:
     if sys.platform == "darwin":
-        return Path.home() / "Library" / "Application Support" / "dataerai" / "credentials"
+        return (
+            Path.home() / "Library" / "Application Support" / "dataerai" / "credentials"
+        )
     return Path.home() / ".config" / "dataerai" / "credentials"
 
 
@@ -136,9 +138,7 @@ class DataeraiConfig:
         object.__setattr__(self, "server", self.server.rstrip("/"))
 
     @classmethod
-    def from_env(
-        cls, environ: Optional[Mapping[str, str]] = None
-    ) -> "DataeraiConfig":
+    def from_env(cls, environ: Optional[Mapping[str, str]] = None) -> "DataeraiConfig":
         """Build a configuration from environment variables.
 
         Without an explicit ``DATAERAI_DRY_RUN`` the mode is automatic:

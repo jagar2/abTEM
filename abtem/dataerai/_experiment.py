@@ -329,9 +329,7 @@ class Experiment:
                 "owner_type": self.config.owner_type,
                 "dry_run": self.config.dry_run,
             },
-            "environment": self.graph.nodes[self._experiment_key].record[
-                "environment"
-            ],
+            "environment": self.graph.nodes[self._experiment_key].record["environment"],
             "components": {
                 role: keys for role, keys in self._components.items() if keys
             },
@@ -409,9 +407,7 @@ class Experiment:
         for node in manifest["nodes"].values():
             payload = node["payload_path"]
             if payload and payload.startswith(run_dir):
-                node["payload_path"] = str(
-                    Path(payload).relative_to(self.directory)
-                )
+                node["payload_path"] = str(Path(payload).relative_to(self.directory))
         return json_safe(manifest)
 
     def _write_manifest(self) -> None:

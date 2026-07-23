@@ -54,6 +54,11 @@ gpaw = [
     "hankel",
     "sympy",
 ]
+# Dataerai experiment preservation + provenance (see abtem/dataerai/README.md).
+# The integration itself degrades gracefully without this extra installed.
+dataerai = [
+    "dataerai-sdk>=0.2.0b1,<0.3",
+]
 # Install every optional runtime extra at once. GPU packages (cupy, dask-cuda)
 # are intentionally excluded: their wheels are CUDA/RAPIDS-version specific and
 # must be installed to match the local toolkit (see the multi-GPU docs).

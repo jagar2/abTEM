@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Optional, Union
+from typing import Union
 
 from abtem.dataerai._config import DataeraiConfig
 from abtem.dataerai._experiment import track
@@ -36,9 +36,7 @@ def selftest(
 
         potential = abtem.Potential(atoms, sampling=0.2, slice_thickness=2)
         probe = abtem.Probe(energy=80e3, semiangle_cutoff=25)
-        scan = abtem.GridScan(
-            start=(0, 0), end=potential.extent, gpts=(2, 2)
-        )
+        scan = abtem.GridScan(start=(0, 0), end=potential.extent, gpts=(2, 2))
         detector = abtem.AnnularDetector(inner=40, outer=65)
 
         experiment.capture_potential(potential)
@@ -46,15 +44,11 @@ def selftest(
         experiment.capture_scan(scan)
         experiment.capture_detector(detector)
 
-        measurement = probe.scan(
-            potential, scan=scan, detectors=detector
-        ).compute()
+        measurement = probe.scan(potential, scan=scan, detectors=detector).compute()
 
         experiment.capture_measurement(measurement, name="adf")
 
         # a user-style save, picked up by auto-capture
-        measurement.to_zarr(
-            str(experiment.directory / "adf-user-copy.zarr.zip")
-        )
+        measurement.to_zarr(str(experiment.directory / "adf-user-copy.zarr.zip"))
 
     return experiment.directory
