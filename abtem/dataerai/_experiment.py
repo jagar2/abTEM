@@ -24,7 +24,7 @@ from typing import Any, Optional, Union
 from abtem.dataerai._client import PreservationClient
 from abtem.dataerai._config import DataeraiConfig
 from abtem.dataerai._environment import environment_snapshot
-from abtem.dataerai._provenance import ProvenanceGraph
+from abtem.dataerai._provenance import ProvenanceGraph, render_mermaid
 from abtem.dataerai._serialize import (
     component_params,
     describe_measurement,
@@ -35,7 +35,7 @@ from abtem.dataerai._serialize import (
     write_structure,
 )
 
-__all__ = ["Experiment", "capture", "current_experiment", "track"]
+__all__ = ["Experiment", "capture", "current_experiment", "render_report", "track"]
 
 logger = logging.getLogger("abtem.dataerai")
 
@@ -416,43 +416,45 @@ class Experiment:
         (self.directory / "provenance_manifest.json").write_text(
             json.dumps(manifest, indent=2)
         )
-        (self.directory / "PROVENANCE.md").write_text(self._report(manifest))
+        (self.directory / "PROVENANCE.md").write_text(render_report(manifest))
 
-    def _report(self, manifest: dict) -> str:
-        lines = [
-            f"# Provenance: {self.name} ({self.run_id})",
-            "",
-            f"- status: **{manifest['status']}**",
-            f"- started: {manifest['started']}",
-            f"- finished: {manifest['finished']}",
-            f"- abTEM {manifest['environment']['packages'].get('abTEM')}"
-            f" / python {manifest['environment']['python']}",
-            f"- dry run: {manifest['config']['dry_run']}",
-            "",
-            "## Provenance graph",
-            "",
-            "```mermaid",
-            self.graph.mermaid(),
-            "```",
-            "",
-            "## Artifacts",
-            "",
-            "| key | role | name | upload | asset id |",
-            "| --- | --- | --- | --- | --- |",
-        ]
-        for key, node in manifest["nodes"].items():
-            lines.append(
-                f"| {key} | {node['role']} | {node['name']} "
-                f"| {node['upload_status']} | {node['asset_id'] or ''} |"
-            )
-        lines += ["", "## Relationships", ""]
-        for edge in manifest["edges"]:
-            lines.append(
-                f"- `{edge['from']}` --{edge['type']}--> `{edge['to']}`"
-                f" ({edge['link_status']})"
-            )
-        lines.append("")
-        return "\n".join(lines)
+
+def render_report(manifest: dict) -> str:
+    """Render the human-readable ``PROVENANCE.md`` from a manifest dict."""
+    lines = [
+        f"# Provenance: {manifest['name']} ({manifest['run_id']})",
+        "",
+        f"- status: **{manifest['status']}**",
+        f"- started: {manifest['started']}",
+        f"- finished: {manifest['finished']}",
+        f"- abTEM {manifest['environment']['packages'].get('abTEM')}"
+        f" / python {manifest['environment']['python']}",
+        f"- dry run: {manifest['config']['dry_run']}",
+        "",
+        "## Provenance graph",
+        "",
+        "```mermaid",
+        render_mermaid(manifest["nodes"], manifest["edges"]),
+        "```",
+        "",
+        "## Artifacts",
+        "",
+        "| key | role | name | upload | asset id |",
+        "| --- | --- | --- | --- | --- |",
+    ]
+    for key, node in manifest["nodes"].items():
+        lines.append(
+            f"| {key} | {node['role']} | {node['name']} "
+            f"| {node['upload_status']} | {node['asset_id'] or ''} |"
+        )
+    lines += ["", "## Relationships", ""]
+    for edge in manifest["edges"]:
+        lines.append(
+            f"- `{edge['from']}` --{edge['type']}--> `{edge['to']}`"
+            f" ({edge['link_status']})"
+        )
+    lines.append("")
+    return "\n".join(lines)
 
 
 def _abtem_version() -> str:

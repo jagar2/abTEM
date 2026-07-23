@@ -13,7 +13,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
-__all__ = ["ProvenanceEdge", "ProvenanceGraph", "ProvenanceNode"]
+__all__ = ["ProvenanceEdge", "ProvenanceGraph", "ProvenanceNode", "render_mermaid"]
 
 
 def _slugify(text: str) -> str:
@@ -160,9 +160,15 @@ class ProvenanceGraph:
 
     def mermaid(self) -> str:
         """Render the DAG as a mermaid ``graph TD`` diagram."""
-        lines = ["graph TD"]
-        for key, node in self._nodes.items():
-            lines.append(f'    {key}["{node.role}: {node.name}"]')
-        for edge in self._edges:
-            lines.append(f"    {edge.from_key} -- {edge.type} --> {edge.to_key}")
-        return "\n".join(lines)
+        exported = self.as_dict()
+        return render_mermaid(exported["nodes"], exported["edges"])
+
+
+def render_mermaid(nodes: dict, edges: list) -> str:
+    """Mermaid ``graph TD`` from manifest-shaped ``nodes``/``edges`` dicts."""
+    lines = ["graph TD"]
+    for key, node in nodes.items():
+        lines.append(f'    {key}["{node["role"]}: {node["name"]}"]')
+    for edge in edges:
+        lines.append(f"    {edge['from']} -- {edge['type']} --> {edge['to']}")
+    return "\n".join(lines)
