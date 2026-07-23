@@ -67,6 +67,12 @@ runs both together:
 %dataerai --finish   # publishes the traced execution log
 ```
 
+Every notebook in this repository (and in the abTEM documentation fork)
+carries a guarded version of these cells, stamped by
+[`tools/add_dataerai_provenance.py`](../../tools/add_dataerai_provenance.py):
+tracing activates when the SDK and daemon are present and degrades to a
+one-line notice otherwise. Run the tool with `--check` to gate CI.
+
 ## Provenance model
 
 Each captured artifact becomes a *node* (and, when delivery is enabled, a
