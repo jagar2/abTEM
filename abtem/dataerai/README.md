@@ -52,6 +52,21 @@ Run `python -m abtem.dataerai selftest` for an offline end-to-end check (a
 miniature tracked STEM simulation); add `--live` to deliver it to a real
 server using your ambient credentials.
 
+## Notebook execution logs (`%dataerai` magic)
+
+In a notebook, the Dataerai SDK's IPython magic complements `track()`: the
+magic publishes the **full execution log** of the notebook run (cell source,
+outputs, logs, transfers, and environment), while `track()` builds the
+artifact-level provenance graph. [`demos/dataerai_provenance_demo.ipynb`](../../demos/dataerai_provenance_demo.ipynb)
+runs both together:
+
+```python
+%load_ext dataerai.magics
+%dataerai --trace --notebook my_analysis.ipynb My project / My collection
+# ... run your abTEM simulation, e.g. inside abtem.dataerai.track(...) ...
+%dataerai --finish   # publishes the traced execution log
+```
+
 ## Provenance model
 
 Each captured artifact becomes a *node* (and, when delivery is enabled, a
