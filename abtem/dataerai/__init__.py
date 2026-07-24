@@ -10,6 +10,8 @@ from abtem.dataerai._experiment import (
     Experiment,
     capture,
     current_experiment,
+    finish_run,
+    start_run,
     track,
 )
 
@@ -21,5 +23,7 @@ __all__ = [
     "current_experiment",
     "discover_token",
     "environment_snapshot",
+    "finish_run",
+    "start_run",
     "track",
 ]

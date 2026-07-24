@@ -21,7 +21,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional, Union
 
-from abtem.dataerai._client import PreservationClient
+from abtem.dataerai._client import PreservationClient, active_notebook_session
 from abtem.dataerai._config import DataeraiConfig
 from abtem.dataerai._environment import environment_snapshot
 from abtem.dataerai._provenance import ProvenanceGraph, render_mermaid
@@ -35,7 +35,15 @@ from abtem.dataerai._serialize import (
     write_structure,
 )
 
-__all__ = ["Experiment", "capture", "current_experiment", "render_report", "track"]
+__all__ = [
+    "Experiment",
+    "capture",
+    "current_experiment",
+    "finish_run",
+    "render_report",
+    "start_run",
+    "track",
+]
 
 logger = logging.getLogger("abtem.dataerai")
 
@@ -381,18 +389,53 @@ class Experiment:
             self._collection_destination = destination
             self._collection_status = "resolved"
 
+    def _prepare_session(self):
+        """Discover an active notebook trace and route delivery through it.
+
+        When a ``%dataerai --trace`` session is active its client is used for
+        uploads and edges, so the experiment's artifacts become products of
+        the notebook execution trace and its lineage is recorded there. An
+        explicit ``collection`` that conflicts with the session's bound
+        collection disables this and falls back to the direct client.
+        """
+        if self.config.dry_run:
+            return None
+        try:
+            session = active_notebook_session()
+        except Exception:
+            return None
+        if session is None:
+            return None
+        session_path = getattr(session, "collection_path", None)
+        if self.collection and session_path and self.collection != session_path:
+            logger.info(
+                "dataerai run %s: explicit collection %r differs from the active "
+                "notebook session %r; using the direct client",
+                self.run_id,
+                self.collection,
+                session_path,
+            )
+            return None
+        self._client.use_session(session)
+        self._collection_status = f"notebook-session:{session_path}"
+        return session
+
     def _deliver(self) -> None:
-        self._resolve_collection()
-        destination = self._collection_destination
-        filing = (
-            {
-                "collection_id": destination.collection_id,
-                "owner_type": "project",
-                "owner_id": destination.project_id,
-            }
-            if destination is not None
-            else {}
-        )
+        session = self._prepare_session()
+        if session is None:
+            self._resolve_collection()
+            destination = self._collection_destination
+            filing = (
+                {
+                    "collection_id": destination.collection_id,
+                    "owner_type": "project",
+                    "owner_id": destination.project_id,
+                }
+                if destination is not None
+                else {}
+            )
+        else:
+            filing = {}
 
         for key, node in self.graph.nodes.items():
             if node.payload_path is None or not node.payload_path.exists():
@@ -555,6 +598,52 @@ def _uninstall_autocapture() -> None:
         _ORIGINAL_TO_ZARR = None
 
 
+def start_run(
+    name: Optional[str] = None,
+    directory: Union[str, Path] = "dataerai-runs",
+    *,
+    config: Optional[DataeraiConfig] = None,
+    run_id: Optional[str] = None,
+    autocapture: bool = True,
+    collection: Optional[str] = None,
+) -> "Experiment":
+    """Begin a tracked experiment and make it active.
+
+    The non-context-manager form of :func:`track`, for notebooks where the
+    experiment spans several cells: call :func:`finish_run` in a later cell
+    to upload, link, and write the manifest. Raises if a run is already
+    active.
+    """
+    global _ACTIVE
+    if _ACTIVE is not None:
+        raise RuntimeError(
+            f"a Dataerai experiment is already active ({_ACTIVE.run_id})"
+        )
+    experiment = Experiment(
+        name=name,
+        directory=directory,
+        config=config,
+        run_id=run_id,
+        autocapture=autocapture,
+        collection=collection,
+    )
+    _ACTIVE = experiment
+    _install_autocapture()
+    return experiment
+
+
+def finish_run(status: str = "completed") -> Optional["Experiment"]:
+    """Finalize the active run started by :func:`start_run` (or None)."""
+    global _ACTIVE
+    experiment = _ACTIVE
+    if experiment is None:
+        return None
+    _ACTIVE = None
+    _uninstall_autocapture()
+    experiment.finalize(status=status)
+    return experiment
+
+
 @contextmanager
 def track(
     name: Optional[str] = None,
@@ -584,13 +673,7 @@ def track(
         (created if missing, project included). Defaults to
         ``DATAERAI_COLLECTION``; assets are then owned by that project.
     """
-    global _ACTIVE
-    if _ACTIVE is not None:
-        raise RuntimeError(
-            f"a Dataerai experiment is already active ({_ACTIVE.run_id})"
-        )
-
-    experiment = Experiment(
+    experiment = start_run(
         name=name,
         directory=directory,
         config=config,
@@ -598,16 +681,10 @@ def track(
         autocapture=autocapture,
         collection=collection,
     )
-    _ACTIVE = experiment
-    _install_autocapture()
     try:
         yield experiment
     except BaseException:
-        _ACTIVE = None
-        _uninstall_autocapture()
-        experiment.finalize(status="failed")
+        finish_run(status="failed")
         raise
     else:
-        _ACTIVE = None
-        _uninstall_autocapture()
-        experiment.finalize(status="completed")
+        finish_run(status="completed")

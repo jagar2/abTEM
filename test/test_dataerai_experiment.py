@@ -11,7 +11,13 @@ import pytest
 
 import abtem
 from abtem.array import ComputableList
-from abtem.dataerai import capture, current_experiment, track
+from abtem.dataerai import (
+    capture,
+    current_experiment,
+    finish_run,
+    start_run,
+    track,
+)
 from abtem.dataerai._config import DataeraiConfig
 
 
@@ -516,3 +522,150 @@ def node_key(manifest, node):
         if candidate is node:
             return key
     raise AssertionError("node not in manifest")
+
+
+class _FakeNotebookSession:
+    """Mirror of a tracing NotebookSession for the experiment layer."""
+
+    def __init__(self, collection_path="Microscopy/abTEM"):
+        self.collection_path = collection_path
+        self.project_id = "70000000-0000-0000-0000-000000000009"
+        self.collection_id = "80000000-0000-0000-0000-000000000008"
+        self.trace_run_id = "nb-run-1"
+        self.uploads = []
+        self.relationships = []
+
+    def upload(self, local_path, *, title, **kwargs):
+        for forbidden in ("owner_type", "owner_id", "collection_id"):
+            assert forbidden not in kwargs
+        self.uploads.append((local_path, title, kwargs))
+        return types.SimpleNamespace(asset_id=f"nb-asset-{len(self.uploads)}")
+
+    def create_relationship(self, from_asset_id, to_asset_id, rel_type, **kwargs):
+        self.relationships.append((from_asset_id, to_asset_id, rel_type, kwargs))
+        return types.SimpleNamespace(id="nb-rel", type=rel_type)
+
+
+class TestNotebookSessionUnification:
+    def test_uploads_and_links_route_through_session(
+        self, tmp_path, atoms, monkeypatch
+    ):
+        session = _FakeNotebookSession()
+        monkeypatch.setattr(
+            "abtem.dataerai._experiment.active_notebook_session", lambda: session
+        )
+        config = DataeraiConfig(dry_run=False)
+
+        with track(directory=tmp_path, config=config, run_id="r1") as experiment:
+            experiment.capture_structure(atoms)
+            experiment.capture_potential(abtem.Potential(atoms, sampling=0.2))
+            experiment.capture_measurement(
+                abtem.Images(np.ones((8, 8), dtype=np.float32), sampling=0.1),
+                name="m",
+            )
+
+        manifest = read_manifest(tmp_path, "r1")
+        assert (
+            manifest["config"]["collection_status"]
+            == "notebook-session:Microscopy/abTEM"
+        )
+        uploaded = [
+            node
+            for node in manifest["nodes"].values()
+            if node["upload_status"] == "uploaded"
+        ]
+        assert uploaded
+        assert all(node["asset_id"].startswith("nb-asset-") for node in uploaded)
+        assert len(session.uploads) == len(uploaded)
+
+        linked = [
+            edge for edge in manifest["edges"] if edge["link_status"] == "created"
+        ]
+        assert linked
+        assert len(session.relationships) == len(linked)
+
+    def test_conflicting_collection_bypasses_session(
+        self, tmp_path, atoms, monkeypatch, fake_sdk
+    ):
+        session = _FakeNotebookSession(collection_path="A/B")
+        monkeypatch.setattr(
+            "abtem.dataerai._experiment.active_notebook_session", lambda: session
+        )
+        config = DataeraiConfig(dry_run=False)
+
+        with track(
+            directory=tmp_path, config=config, run_id="r1", collection="C/D"
+        ) as experiment:
+            experiment.capture_structure(atoms)
+
+        # session left untouched; the direct SDK client was used instead
+        assert session.uploads == []
+        assert FakeSdkClient.instances
+
+    def test_no_session_uses_direct_client(
+        self, tmp_path, atoms, monkeypatch, fake_sdk
+    ):
+        monkeypatch.setattr(
+            "abtem.dataerai._experiment.active_notebook_session", lambda: None
+        )
+        config = DataeraiConfig(dry_run=False)
+
+        with track(directory=tmp_path, config=config, run_id="r1") as experiment:
+            experiment.capture_structure(atoms)
+
+        manifest = read_manifest(tmp_path, "r1")
+        assert manifest["config"]["collection_status"] is None
+        assert FakeSdkClient.instances
+
+
+class TestStartFinishRun:
+    def test_start_run_activates(self, tmp_path):
+        exp = start_run(directory=tmp_path, config=DRY, run_id="r1")
+        try:
+            assert current_experiment() is exp
+        finally:
+            finish_run()
+        assert current_experiment() is None
+
+    def test_finish_run_writes_manifest(self, tmp_path, atoms):
+        exp = start_run(directory=tmp_path, config=DRY, run_id="r1")
+        exp.capture_structure(atoms)
+        result = finish_run()
+
+        assert result is exp
+        manifest = read_manifest(tmp_path, "r1")
+        assert manifest["status"] == "completed"
+        assert current_experiment() is None
+
+    def test_finish_run_without_active_returns_none(self):
+        assert finish_run() is None
+
+    def test_double_start_raises(self, tmp_path):
+        start_run(directory=tmp_path, config=DRY, run_id="r1")
+        try:
+            with pytest.raises(RuntimeError, match="already active"):
+                start_run(directory=tmp_path, config=DRY, run_id="r2")
+        finally:
+            finish_run()
+
+    def test_finish_run_failed_status(self, tmp_path):
+        start_run(directory=tmp_path, config=DRY, run_id="r1")
+        finish_run(status="failed")
+
+        manifest = read_manifest(tmp_path, "r1")
+        assert manifest["status"] == "failed"
+
+    def test_start_run_installs_autocapture(self, tmp_path, images):
+        start_run(directory=tmp_path, config=DRY, run_id="r1")
+        try:
+            images.to_zarr(str(tmp_path / "auto.zarr.zip"))
+        finally:
+            finish_run()
+
+        manifest = read_manifest(tmp_path, "r1")
+        measurements = [
+            node
+            for node in manifest["nodes"].values()
+            if node["role"] == "measurement"
+        ]
+        assert len(measurements) == 1

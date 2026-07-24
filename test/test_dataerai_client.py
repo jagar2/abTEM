@@ -471,6 +471,190 @@ class TestResolveCollection:
         assert kwargs["owner_id"] == "12341234-0000-0000-0000-000000000009"
 
 
+class FakeSession:
+    """Stands in for dataerai.notebook.NotebookSession.
+
+    A session binds its own project/collection, so ``upload`` must be called
+    without owner/collection kwargs; ``create_relationship`` forwards to the
+    bound client and records into the active trace.
+    """
+
+    def __init__(
+        self,
+        collection_path="Proj/Col",
+        project_id="70000000-0000-0000-0000-000000000001",
+        collection_id="80000000-0000-0000-0000-000000000002",
+        trace_run_id="run-abc",
+    ):
+        self.collection_path = collection_path
+        self.project_id = project_id
+        self.collection_id = collection_id
+        self.trace_run_id = trace_run_id
+        self.uploads = []
+        self.relationships = []
+        self.upload_error = None
+        self.relationship_error = None
+
+    def upload(self, local_path, *, title, **kwargs):
+        for forbidden in ("owner_type", "owner_id", "collection_id"):
+            assert forbidden not in kwargs, f"session upload must not bind {forbidden}"
+        if self.upload_error is not None:
+            raise self.upload_error
+        self.uploads.append((local_path, title, kwargs))
+        return types.SimpleNamespace(asset_id=f"sess-asset-{len(self.uploads)}")
+
+    def create_relationship(self, from_asset_id, to_asset_id, rel_type, **kwargs):
+        if self.relationship_error is not None:
+            raise self.relationship_error
+        self.relationships.append((from_asset_id, to_asset_id, rel_type, kwargs))
+        return types.SimpleNamespace(id="sess-rel", type=rel_type)
+
+
+class TestSessionRouting:
+    FROM = "aaaaaaaa-0000-0000-0000-000000000001"
+    TO = "aaaaaaaa-0000-0000-0000-000000000002"
+
+    def test_upload_routes_through_session(self, no_sdk, payload):
+        session = FakeSession()
+        client = PreservationClient(live_config(), session=session)
+
+        outcome = client.upload(
+            payload,
+            title="structure",
+            record_type="sample_specimen",
+            tags=["abtem-dataerai"],
+            metadata={"run_id": "r1"},
+            description="d",
+        )
+
+        assert outcome.status == "uploaded"
+        assert outcome.asset_id == "sess-asset-1"
+        (local_path, title, kwargs) = session.uploads[0]
+        assert local_path == str(payload)
+        assert title == "structure"
+        assert kwargs["record_type"] == "sample_specimen"
+        assert kwargs["tags"] == ["abtem-dataerai"]
+        assert kwargs["metadata"] == {"run_id": "r1"}
+        assert kwargs["description"] == "d"
+
+    def test_upload_session_failure(self, no_sdk, payload):
+        session = FakeSession()
+        session.upload_error = RuntimeError("transfer failed")
+        client = PreservationClient(live_config(), session=session)
+
+        outcome = client.upload(payload, title="t")
+
+        assert outcome.status == "failed"
+        assert "transfer failed" in outcome.detail
+
+    def test_dry_run_skips_even_with_session(self, no_sdk, payload):
+        session = FakeSession()
+        client = PreservationClient(DataeraiConfig(dry_run=True), session=session)
+
+        outcome = client.upload(payload, title="t")
+
+        assert outcome.status == "skipped"
+        assert session.uploads == []
+
+    def test_link_routes_through_session(self, no_sdk):
+        session = FakeSession()
+        client = PreservationClient(live_config(), session=session)
+
+        outcome = client.link(
+            self.FROM,
+            self.TO,
+            "derived_from",
+            qualifiers={"role": "origin"},
+            analysis_mode="non_destructive",
+            qualifier_note="note",
+        )
+
+        assert outcome.status == "created"
+        (from_id, to_id, rel_type, kwargs) = session.relationships[0]
+        assert (from_id, to_id, rel_type) == (self.FROM, self.TO, "derived_from")
+        assert kwargs["qualifiers"] == {"role": "origin"}
+        assert kwargs["analysis_mode"] == "non_destructive"
+        assert kwargs["qualifier_note"] == "note"
+
+    def test_link_existing_through_session(self, no_sdk):
+        session = FakeSession()
+        session.relationship_error = RuntimeError("ERR_RELATIONSHIP_EXISTS")
+        client = PreservationClient(live_config(), session=session)
+
+        outcome = client.link(self.FROM, self.TO, "derived_from")
+
+        assert outcome.status == "exists"
+
+    def test_link_session_failure(self, no_sdk):
+        session = FakeSession()
+        session.relationship_error = RuntimeError("permission denied")
+        client = PreservationClient(live_config(), session=session)
+
+        outcome = client.link(self.FROM, self.TO, "derived_from")
+
+        assert outcome.status == "failed"
+        assert "permission denied" in outcome.detail
+
+    def test_use_session_setter(self, no_sdk, payload):
+        session = FakeSession()
+        client = PreservationClient(live_config())
+        client.use_session(session)
+
+        outcome = client.upload(payload, title="t")
+
+        assert outcome.status == "uploaded"
+        assert len(session.uploads) == 1
+
+
+class TestActiveNotebookSession:
+    def test_no_ipython_returns_none(self, monkeypatch):
+        from abtem.dataerai import _client
+
+        monkeypatch.setitem(sys.modules, "IPython", None)  # forces ImportError
+
+        assert _client.active_notebook_session() is None
+
+    def test_finds_tracing_session(self, monkeypatch):
+        from abtem.dataerai import _client
+
+        session = FakeSession()
+        fake_shell = types.SimpleNamespace(user_ns={"x": 1, "dataerai_session": session})
+        ipython_module = types.ModuleType("IPython")
+        ipython_module.get_ipython = lambda: fake_shell
+        notebook_module = types.ModuleType("dataerai.notebook")
+        notebook_module.NotebookSession = FakeSession
+        monkeypatch.setitem(sys.modules, "IPython", ipython_module)
+        monkeypatch.setitem(sys.modules, "dataerai.notebook", notebook_module)
+
+        assert _client.active_notebook_session() is session
+
+    def test_ignores_non_tracing_session(self, monkeypatch):
+        from abtem.dataerai import _client
+
+        session = FakeSession(trace_run_id=None)
+        fake_shell = types.SimpleNamespace(user_ns={"s": session})
+        ipython_module = types.ModuleType("IPython")
+        ipython_module.get_ipython = lambda: fake_shell
+        notebook_module = types.ModuleType("dataerai.notebook")
+        notebook_module.NotebookSession = FakeSession
+        monkeypatch.setitem(sys.modules, "IPython", ipython_module)
+        monkeypatch.setitem(sys.modules, "dataerai.notebook", notebook_module)
+
+        assert _client.active_notebook_session() is None
+
+    def test_no_shell_returns_none(self, monkeypatch):
+        from abtem.dataerai import _client
+
+        ipython_module = types.ModuleType("IPython")
+        ipython_module.get_ipython = lambda: None
+        notebook_module = types.ModuleType("dataerai.notebook")
+        notebook_module.NotebookSession = FakeSession
+        monkeypatch.setitem(sys.modules, "IPython", ipython_module)
+        monkeypatch.setitem(sys.modules, "dataerai.notebook", notebook_module)
+
+        assert _client.active_notebook_session() is None
+
+
 class TestPostJson:
     def test_posts_bearer_json(self, monkeypatch):
         from abtem.dataerai import _client

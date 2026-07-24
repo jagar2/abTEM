@@ -23,7 +23,45 @@ from urllib.request import Request, urlopen
 
 from abtem.dataerai._config import DataeraiConfig
 
-__all__ = ["LinkOutcome", "PreservationClient", "UploadOutcome"]
+__all__ = [
+    "LinkOutcome",
+    "PreservationClient",
+    "UploadOutcome",
+    "active_notebook_session",
+]
+
+
+def active_notebook_session():
+    """Return an in-progress Dataerai notebook session, if one is active.
+
+    The ``%dataerai --trace`` magic stores a ``NotebookSession`` in the
+    running IPython kernel's namespace. Discovering it lets
+    :func:`~abtem.dataerai.track` route uploads and edges through the
+    session, so a tracked experiment's artifacts become products of the
+    notebook execution trace and its lineage is recorded there. Returns
+    ``None`` outside a notebook, or when no session is actively tracing.
+    """
+    try:
+        import IPython
+        from dataerai.notebook import NotebookSession
+    except ImportError:
+        return None
+
+    try:
+        shell = IPython.get_ipython()
+    except Exception:
+        return None
+    if shell is None:
+        return None
+
+    for value in list(getattr(shell, "user_ns", {}).values()):
+        if isinstance(value, NotebookSession):
+            try:
+                if value.trace_run_id is not None:
+                    return value
+            except Exception:
+                continue
+    return None
 
 
 @dataclass(frozen=True)
@@ -71,12 +109,17 @@ def _post_json(
 class PreservationClient:
     """Uploads and provenance links for one experiment, per the config."""
 
-    def __init__(self, config: DataeraiConfig):
+    def __init__(self, config: DataeraiConfig, session: Any = None):
         self._config = config
+        self._session = session
         self._sdk_client: Any = None
         self._sdk_state = "untried"  # "untried" | "ready" | "missing" | "broken"
         self._sdk_error: Optional[str] = None
         self._owner: Optional[tuple[str, str]] = None
+
+    def use_session(self, session: Any) -> None:
+        """Route uploads and edges through an active notebook session."""
+        self._session = session
 
     def _ensure_sdk(self) -> tuple[Any, Optional[str]]:
         """Import the SDK, build a client, and connect it, once.
@@ -177,6 +220,16 @@ class PreservationClient:
         if self._config.dry_run:
             return UploadOutcome(status="skipped", detail="dry-run")
 
+        if self._session is not None:
+            return self._upload_via_session(
+                path,
+                title=title,
+                record_type=record_type,
+                tags=tags,
+                metadata=metadata,
+                description=description,
+            )
+
         sdk_client, detail = self._ensure_sdk()
         if sdk_client is None:
             status = "skipped" if self._sdk_state == "missing" else "failed"
@@ -201,6 +254,29 @@ class PreservationClient:
 
         return UploadOutcome(status="uploaded", asset_id=result.asset_id)
 
+    def _upload_via_session(
+        self,
+        path,
+        *,
+        title,
+        record_type,
+        tags,
+        metadata,
+        description,
+    ) -> UploadOutcome:
+        try:
+            result = self._session.upload(
+                str(path),
+                title=title,
+                record_type=record_type,
+                tags=tags,
+                metadata=metadata,
+                description=description,
+            )
+        except Exception as error:
+            return UploadOutcome(status="failed", detail=str(error))
+        return UploadOutcome(status="uploaded", asset_id=result.asset_id)
+
     def link(
         self,
         from_asset_id: str,
@@ -214,6 +290,16 @@ class PreservationClient:
         """Create a provenance edge ``from (derived) → to (origin)``."""
         if self._config.dry_run:
             return LinkOutcome(status="skipped", detail="dry-run")
+
+        if self._session is not None and hasattr(self._session, "create_relationship"):
+            return self._link_via_session(
+                from_asset_id,
+                to_asset_id,
+                rel_type,
+                qualifiers=qualifiers,
+                analysis_mode=analysis_mode,
+                qualifier_note=qualifier_note,
+            )
 
         sdk_client, detail = self._ensure_sdk()
         if sdk_client is not None and hasattr(sdk_client, "create_relationship"):
@@ -243,6 +329,32 @@ class PreservationClient:
             status="skipped",
             detail="no SDK create_relationship and no bearer token",
         )
+
+    def _link_via_session(
+        self,
+        from_asset_id,
+        to_asset_id,
+        rel_type,
+        *,
+        qualifiers,
+        analysis_mode,
+        qualifier_note,
+    ) -> LinkOutcome:
+        try:
+            self._session.create_relationship(
+                from_asset_id,
+                to_asset_id,
+                rel_type,
+                qualifiers=qualifiers,
+                analysis_mode=analysis_mode,
+                qualifier_note=qualifier_note,
+            )
+        except Exception as error:
+            code = getattr(error, "code", "") or str(error)
+            if "EXISTS" in code.upper():
+                return LinkOutcome(status="exists")
+            return LinkOutcome(status="failed", detail=str(error))
+        return LinkOutcome(status="created")
 
     def _link_via_sdk(
         self,
