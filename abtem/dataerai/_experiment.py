@@ -437,14 +437,22 @@ class Experiment:
         else:
             filing = {}
 
+        used_titles: dict[str, int] = {}
         for key, node in self.graph.nodes.items():
             if node.payload_path is None or not node.payload_path.exists():
                 node.upload_status = "skipped"
                 node.upload_detail = "payload missing (deferred or deleted write)"
                 continue
+            # The server upserts assets by title within a collection, so two
+            # same-named nodes (e.g. two GridScans) would collapse into one
+            # asset. Disambiguate deterministically by insertion order.
+            base_title = f"{self.name} / {node.role}: {node.name}"
+            seen = used_titles.get(base_title, 0)
+            used_titles[base_title] = seen + 1
+            title = base_title if seen == 0 else f"{base_title} ({seen + 1})"
             outcome = self._client.upload(
                 node.payload_path,
-                title=f"{self.name} / {node.role}: {node.name}",
+                title=title,
                 record_type=node.record_type,
                 tags=[
                     "abtem-dataerai",

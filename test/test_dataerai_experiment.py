@@ -332,6 +332,7 @@ class FakeSdkClient:
         self.connected = False
         self.closed = False
         self._counter = 0
+        self._by_title = []
         FakeSdkClient.instances.append(self)
 
     def connect(self):
@@ -351,9 +352,17 @@ class FakeSdkClient:
 
     def upload(self, local_path, **kwargs):
         self._require_connected()
-        self._counter += 1
         self.uploads.append((local_path, kwargs))
-        return FakeUploadResult(asset_id=f"00000000-0000-0000-0000-{self._counter:012d}")
+        # Faithful to the real daemon: assets are upserted by title within a
+        # collection, so an identical title returns the same asset id.
+        title = kwargs.get("title")
+        existing = {kw.get("title"): aid for (_, kw), aid in self._by_title}
+        if title in existing:
+            return FakeUploadResult(asset_id=existing[title])
+        self._counter += 1
+        asset_id = f"00000000-0000-0000-0000-{self._counter:012d}"
+        self._by_title.append(((local_path, kwargs), asset_id))
+        return FakeUploadResult(asset_id=asset_id)
 
     def create_relationship(self, from_asset_id, to_asset_id, rel_type, **kwargs):
         self._require_connected()
@@ -389,6 +398,30 @@ def fake_sdk(monkeypatch):
 
 
 class TestLiveFinalize:
+    def test_duplicate_component_names_stay_distinct_assets(
+        self, tmp_path, atoms, fake_sdk
+    ):
+        # Two grid scans with the same auto-generated name must not collapse
+        # into one asset (the daemon upserts by title within a collection).
+        config = DataeraiConfig(dry_run=False)
+
+        with track(name="dup", directory=tmp_path, config=config, run_id="r1") as exp:
+            exp.capture_scan(abtem.GridScan(start=(0, 0), end=(4, 4), sampling=0.5))
+            exp.capture_scan(abtem.GridScan(start=(0, 0), end=(4, 4), sampling=0.25))
+
+        sdk = FakeSdkClient.instances[0]
+        titles = [kw["title"] for _, kw in sdk.uploads]
+        assert len(titles) == len(set(titles)), f"duplicate upload titles: {titles}"
+
+        manifest = read_manifest(tmp_path, "r1")
+        scan_ids = [
+            n["asset_id"]
+            for n in manifest["nodes"].values()
+            if n["role"] == "scan"
+        ]
+        assert len(scan_ids) == 2
+        assert scan_ids[0] != scan_ids[1]
+
     def test_all_nodes_uploaded_and_linked(self, tmp_path, atoms, images, fake_sdk):
         config = DataeraiConfig(dry_run=False)
 
