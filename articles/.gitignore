@@ -1,0 +1,9 @@
+# Regenerable simulation data — recomputed by running the notebooks.
+*.zarr.zip
+*.pdf
+*.hdf5
+
+# Local Dataerai provenance run output (manifest, report, artifacts).
+# The provenance is preserved on the Dataerai server; these local copies
+# are per-run and do not belong in version control.
+dataerai-runs/

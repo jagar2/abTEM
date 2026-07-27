@@ -1,0 +1,704 @@
+"""Tests for abtem.dataerai._experiment: track(), captures, auto-capture."""
+
+import json
+import sys
+import types
+from dataclasses import dataclass
+
+import ase.build
+import numpy as np
+import pytest
+
+import abtem
+from abtem.array import ComputableList
+from abtem.dataerai import (
+    capture,
+    current_experiment,
+    finish_run,
+    start_run,
+    track,
+)
+from abtem.dataerai._config import DataeraiConfig
+
+
+@pytest.fixture
+def atoms():
+    return ase.build.bulk("Si", cubic=True) * (2, 2, 2)
+
+
+@pytest.fixture
+def images():
+    return abtem.Images(
+        np.ones((8, 8), dtype=np.float32), sampling=0.1, metadata={"energy": 100e3}
+    )
+
+
+DRY = DataeraiConfig(dry_run=True)
+
+
+def read_manifest(directory, run_id):
+    path = directory / run_id / "provenance_manifest.json"
+    assert path.exists()
+    return json.loads(path.read_text())
+
+
+def nodes_with_role(manifest, role):
+    return {
+        key: node
+        for key, node in manifest["nodes"].items()
+        if node["role"] == role
+    }
+
+
+def has_edge(manifest, from_role, to_role, rel_type):
+    roles = {key: node["role"] for key, node in manifest["nodes"].items()}
+    return any(
+        roles[edge["from"]] == from_role
+        and roles[edge["to"]] == to_role
+        and edge["type"] == rel_type
+        for edge in manifest["edges"]
+    )
+
+
+class TestTrackLifecycle:
+    def test_manifest_and_report_written(self, tmp_path, atoms):
+        with track(
+            name="lifecycle", directory=tmp_path, config=DRY, run_id="r1"
+        ) as experiment:
+            experiment.capture_structure(atoms)
+
+        manifest = read_manifest(tmp_path, "r1")
+        assert manifest["run_id"] == "r1"
+        assert manifest["name"] == "lifecycle"
+        assert manifest["status"] == "completed"
+        assert manifest["environment"]["packages"]["abTEM"] == abtem.__version__
+        assert manifest["config"]["dry_run"] is True
+        assert "token" not in json.dumps(manifest)
+
+        report = (tmp_path / "r1" / "PROVENANCE.md").read_text()
+        assert "graph TD" in report
+
+    def test_experiment_node_created(self, tmp_path):
+        with track(name="e", directory=tmp_path, config=DRY, run_id="r1"):
+            pass
+
+        manifest = read_manifest(tmp_path, "r1")
+        experiments = nodes_with_role(manifest, "experiment")
+        assert len(experiments) == 1
+        (node,) = experiments.values()
+        assert node["record_type"] == "simulation"
+        assert node["record"]["environment"]["python"]
+        # experiment record payload exists and embeds the run description
+        payload = json.loads((tmp_path / "r1" / node["payload_path"]).read_text())
+        assert payload["run_id"] == "r1"
+
+    def test_current_experiment_scoped(self, tmp_path):
+        assert current_experiment() is None
+        with track(directory=tmp_path, config=DRY, run_id="r1") as experiment:
+            assert current_experiment() is experiment
+        assert current_experiment() is None
+
+    def test_nested_track_raises(self, tmp_path):
+        with track(directory=tmp_path, config=DRY, run_id="r1"):
+            with pytest.raises(RuntimeError, match="already active"):
+                with track(directory=tmp_path, config=DRY, run_id="r2"):
+                    pass
+
+    def test_exception_marks_failed_and_restores(self, tmp_path, atoms):
+        original = ComputableList.to_zarr
+
+        with pytest.raises(ValueError, match="boom"):
+            with track(directory=tmp_path, config=DRY, run_id="r1") as experiment:
+                experiment.capture_structure(atoms)
+                raise ValueError("boom")
+
+        manifest = read_manifest(tmp_path, "r1")
+        assert manifest["status"] == "failed"
+        assert current_experiment() is None
+        assert ComputableList.to_zarr is original
+
+    def test_unique_run_ids_generated(self, tmp_path):
+        with track(directory=tmp_path, config=DRY) as first:
+            pass
+        with track(directory=tmp_path, config=DRY) as second:
+            pass
+
+        assert first.run_id != second.run_id
+        assert (tmp_path / first.run_id).is_dir()
+        assert (tmp_path / second.run_id).is_dir()
+
+
+class TestCaptures:
+    def test_structure(self, tmp_path, atoms):
+        with track(directory=tmp_path, config=DRY, run_id="r1") as experiment:
+            key = experiment.capture_structure(atoms)
+
+        manifest = read_manifest(tmp_path, "r1")
+        node = manifest["nodes"][key]
+        assert node["role"] == "structure"
+        assert node["record_type"] == "sample_specimen"
+        assert node["record"]["structure"]["formula"] == "Si64"
+        payload = tmp_path / "r1" / node["payload_path"]
+        assert payload.exists()
+        assert ase.io.read(payload).get_chemical_formula() == "Si64"
+        assert node["record"]["payload_sha256"]
+
+    def test_potential_links_structure(self, tmp_path, atoms):
+        with track(directory=tmp_path, config=DRY, run_id="r1") as experiment:
+            experiment.capture_structure(atoms)
+            key = experiment.capture_potential(
+                abtem.Potential(atoms, sampling=0.2, slice_thickness=2)
+            )
+
+        manifest = read_manifest(tmp_path, "r1")
+        node = manifest["nodes"][key]
+        assert node["role"] == "potential"
+        assert has_edge(manifest, "potential", "structure", "derived_from")
+        assert has_edge(manifest, "potential", "experiment", "config_for")
+        payload = json.loads((tmp_path / "r1" / node["payload_path"]).read_text())
+        assert payload["type"].endswith("Potential")
+
+    def test_component_captures_link_experiment(self, tmp_path):
+        with track(directory=tmp_path, config=DRY, run_id="r1") as experiment:
+            experiment.capture_illumination(
+                abtem.Probe(energy=100e3, semiangle_cutoff=20)
+            )
+            experiment.capture_scan(abtem.GridScan(start=(0, 0), end=(2, 2), gpts=4))
+            experiment.capture_detector(abtem.AnnularDetector(inner=60, outer=180))
+
+        manifest = read_manifest(tmp_path, "r1")
+        for role in ("illumination", "scan", "detector"):
+            assert len(nodes_with_role(manifest, role)) == 1
+            assert has_edge(manifest, role, "experiment", "config_for")
+
+    def test_measurement_full_edge_set(self, tmp_path, atoms, images):
+        with track(directory=tmp_path, config=DRY, run_id="r1") as experiment:
+            experiment.capture_structure(atoms)
+            experiment.capture_potential(abtem.Potential(atoms, sampling=0.2))
+            experiment.capture_illumination(abtem.Probe(energy=100e3))
+            experiment.capture_scan(abtem.GridScan(start=(0, 0), end=(2, 2), gpts=4))
+            experiment.capture_detector(abtem.AnnularDetector(inner=60))
+            key = experiment.capture_measurement(images, name="haadf")
+
+        manifest = read_manifest(tmp_path, "r1")
+        node = manifest["nodes"][key]
+        assert node["role"] == "measurement"
+        assert node["record_type"] == "imaging"
+        assert node["record"]["measurement"]["type"] == "Images"
+        assert node["record"]["payload_sha256"]
+        assert (tmp_path / "r1" / node["payload_path"]).exists()
+
+        assert has_edge(manifest, "measurement", "experiment", "acquired_with")
+        assert has_edge(manifest, "measurement", "potential", "derived_from")
+        assert has_edge(manifest, "measurement", "illumination", "acquired_with")
+        assert has_edge(manifest, "measurement", "scan", "acquired_with")
+        assert has_edge(manifest, "measurement", "detector", "acquired_with")
+
+    def test_measurement_roundtrips_from_zarr(self, tmp_path, images):
+        with track(directory=tmp_path, config=DRY, run_id="r1") as experiment:
+            key = experiment.capture_measurement(images, name="m")
+
+        manifest = read_manifest(tmp_path, "r1")
+        restored = abtem.from_zarr(
+            str(tmp_path / "r1" / manifest["nodes"][key]["payload_path"])
+        ).compute()
+        assert np.allclose(restored.array, images.array)
+
+    def test_measurement_without_components(self, tmp_path, images):
+        with track(directory=tmp_path, config=DRY, run_id="r1") as experiment:
+            experiment.capture_measurement(images, name="m")
+
+        manifest = read_manifest(tmp_path, "r1")
+        assert has_edge(manifest, "measurement", "experiment", "acquired_with")
+
+    def test_diffraction_record_type(self, tmp_path):
+        patterns = abtem.DiffractionPatterns(
+            np.ones((8, 8), dtype=np.float32), sampling=0.05
+        )
+
+        with track(directory=tmp_path, config=DRY, run_id="r1") as experiment:
+            key = experiment.capture_measurement(patterns, name="cbed")
+
+        manifest = read_manifest(tmp_path, "r1")
+        assert manifest["nodes"][key]["record_type"] == "diffraction_scattering"
+
+    def test_capture_file(self, tmp_path):
+        artifact = tmp_path / "notes.txt"
+        artifact.write_text("observations")
+
+        with track(directory=tmp_path, config=DRY, run_id="r1") as experiment:
+            key = experiment.capture_file(artifact, role="analysis")
+
+        manifest = read_manifest(tmp_path, "r1")
+        node = manifest["nodes"][key]
+        assert node["role"] == "analysis"
+        assert node["record"]["payload_sha256"]
+
+
+class TestAutoCapture:
+    def test_to_zarr_captured(self, tmp_path, images):
+        url = tmp_path / "saved.zarr.zip"
+
+        with track(directory=tmp_path, config=DRY, run_id="r1"):
+            images.to_zarr(str(url))
+
+        manifest = read_manifest(tmp_path, "r1")
+        measurements = nodes_with_role(manifest, "measurement")
+        assert len(measurements) == 1
+        (node,) = measurements.values()
+        assert node["payload_path"] == str(url)
+        assert has_edge(manifest, "measurement", "experiment", "acquired_with")
+
+    def test_explicit_capture_not_doubled(self, tmp_path, images):
+        with track(directory=tmp_path, config=DRY, run_id="r1") as experiment:
+            experiment.capture_measurement(images, name="m")
+
+        manifest = read_manifest(tmp_path, "r1")
+        assert len(nodes_with_role(manifest, "measurement")) == 1
+
+    def test_autocapture_disabled(self, tmp_path, images):
+        with track(directory=tmp_path, config=DRY, run_id="r1", autocapture=False):
+            images.to_zarr(str(tmp_path / "saved.zarr.zip"))
+
+        manifest = read_manifest(tmp_path, "r1")
+        assert len(nodes_with_role(manifest, "measurement")) == 0
+
+    def test_no_capture_outside_track(self, tmp_path, images):
+        with track(directory=tmp_path, config=DRY, run_id="r1"):
+            pass
+
+        images.to_zarr(str(tmp_path / "outside.zarr.zip"))
+
+        manifest = read_manifest(tmp_path, "r1")
+        assert len(nodes_with_role(manifest, "measurement")) == 0
+
+    def test_computable_list_items_all_captured(self, tmp_path, images):
+        pair = ComputableList([images, images.copy()])
+
+        with track(directory=tmp_path, config=DRY, run_id="r1"):
+            pair.to_zarr(str(tmp_path / "pair.zarr.zip"))
+
+        manifest = read_manifest(tmp_path, "r1")
+        assert len(nodes_with_role(manifest, "measurement")) == 2
+
+
+class TestDispatch:
+    def test_capture_requires_active_experiment(self, atoms):
+        with pytest.raises(RuntimeError, match="track"):
+            capture(atoms)
+
+    def test_capture_dispatches_by_type(self, tmp_path, atoms, images):
+        probe = abtem.Probe(energy=100e3, semiangle_cutoff=20)
+        scan = abtem.GridScan(start=(0, 0), end=(2, 2), gpts=4)
+        detector = abtem.AnnularDetector(inner=60)
+        potential = abtem.Potential(atoms, sampling=0.2)
+        phonons = abtem.FrozenPhonons(atoms, num_configs=2, sigmas=0.1, seed=1)
+
+        with track(directory=tmp_path, config=DRY, run_id="r1"):
+            roles = {
+                capture(atoms): "structure",
+                capture(potential): "potential",
+                capture(probe): "illumination",
+                capture(scan): "scan",
+                capture(detector): "detector",
+                capture(phonons): "sample",
+                capture(images, name="m"): "measurement",
+            }
+
+        manifest = read_manifest(tmp_path, "r1")
+        for key, role in roles.items():
+            assert manifest["nodes"][key]["role"] == role
+
+    def test_capture_rejects_unknown(self, tmp_path):
+        with track(directory=tmp_path, config=DRY, run_id="r1"):
+            with pytest.raises(TypeError, match="cannot capture"):
+                capture(3.14)
+
+
+@dataclass
+class FakeUploadResult:
+    asset_id: str
+
+
+class FakeSdkClient:
+    """Mirrors the published SDK: connect() required, close() expected."""
+
+    instances = []
+
+    def __init__(self, *args, **kwargs):
+        self.uploads = []
+        self.relationships = []
+        self.collection_paths = []
+        self.connected = False
+        self.closed = False
+        self._counter = 0
+        self._by_title = []
+        FakeSdkClient.instances.append(self)
+
+    def connect(self):
+        self.connected = True
+
+    def close(self):
+        self.connected = False
+        self.closed = True
+
+    def _require_connected(self):
+        if not self.connected:
+            raise RuntimeError("Not connected — call connect() first")
+
+    def auth_status(self):
+        self._require_connected()
+        return types.SimpleNamespace(user_id="u-1")
+
+    def upload(self, local_path, **kwargs):
+        self._require_connected()
+        self.uploads.append((local_path, kwargs))
+        # Faithful to the real daemon: assets are upserted by title within a
+        # collection, so an identical title returns the same asset id.
+        title = kwargs.get("title")
+        existing = {kw.get("title"): aid for (_, kw), aid in self._by_title}
+        if title in existing:
+            return FakeUploadResult(asset_id=existing[title])
+        self._counter += 1
+        asset_id = f"00000000-0000-0000-0000-{self._counter:012d}"
+        self._by_title.append(((local_path, kwargs), asset_id))
+        return FakeUploadResult(asset_id=asset_id)
+
+    def create_relationship(self, from_asset_id, to_asset_id, rel_type, **kwargs):
+        self._require_connected()
+        self.relationships.append((from_asset_id, to_asset_id, rel_type, kwargs))
+        return types.SimpleNamespace(id="rel", type=rel_type)
+
+    collection_error = None
+
+    def ensure_collection_path(self, path, *, create_project=False, **kwargs):
+        self._require_connected()
+        if FakeSdkClient.collection_error is not None:
+            raise FakeSdkClient.collection_error
+        self.collection_paths.append((path, create_project))
+        return FakeDestination()
+
+
+@dataclass
+class FakeDestination:
+    path: str = "Microscopy/abTEM"
+    project_id: str = "70707070-0000-0000-0000-000000000001"
+    project_name: str = "Microscopy"
+    collection_id: str = "80808080-0000-0000-0000-000000000002"
+
+
+@pytest.fixture
+def fake_sdk(monkeypatch):
+    module = types.ModuleType("dataerai")
+    module.DataeraiClient = FakeSdkClient
+    monkeypatch.setitem(sys.modules, "dataerai", module)
+    FakeSdkClient.instances = []
+    FakeSdkClient.collection_error = None
+    yield module
+
+
+class TestLiveFinalize:
+    def test_duplicate_component_names_stay_distinct_assets(
+        self, tmp_path, atoms, fake_sdk
+    ):
+        # Two grid scans with the same auto-generated name must not collapse
+        # into one asset (the daemon upserts by title within a collection).
+        config = DataeraiConfig(dry_run=False)
+
+        with track(name="dup", directory=tmp_path, config=config, run_id="r1") as exp:
+            exp.capture_scan(abtem.GridScan(start=(0, 0), end=(4, 4), sampling=0.5))
+            exp.capture_scan(abtem.GridScan(start=(0, 0), end=(4, 4), sampling=0.25))
+
+        sdk = FakeSdkClient.instances[0]
+        titles = [kw["title"] for _, kw in sdk.uploads]
+        assert len(titles) == len(set(titles)), f"duplicate upload titles: {titles}"
+
+        manifest = read_manifest(tmp_path, "r1")
+        scan_ids = [
+            n["asset_id"]
+            for n in manifest["nodes"].values()
+            if n["role"] == "scan"
+        ]
+        assert len(scan_ids) == 2
+        assert scan_ids[0] != scan_ids[1]
+
+    def test_all_nodes_uploaded_and_linked(self, tmp_path, atoms, images, fake_sdk):
+        config = DataeraiConfig(dry_run=False)
+
+        with track(
+            name="live", directory=tmp_path, config=config, run_id="r1"
+        ) as experiment:
+            experiment.capture_structure(atoms)
+            experiment.capture_potential(abtem.Potential(atoms, sampling=0.2))
+            experiment.capture_measurement(images, name="haadf")
+
+        manifest = read_manifest(tmp_path, "r1")
+        for node in manifest["nodes"].values():
+            assert node["upload_status"] == "uploaded"
+            assert node["asset_id"]
+        for edge in manifest["edges"]:
+            assert edge["link_status"] == "created"
+
+        sdk = FakeSdkClient.instances[0]
+        assert len(sdk.uploads) == len(manifest["nodes"])
+        assert len(sdk.relationships) == len(manifest["edges"])
+        # relationships reference uploaded asset ids, derived -> origin
+        uploaded_ids = {
+            node["asset_id"] for node in manifest["nodes"].values()
+        }
+        for from_id, to_id, rel_type, _ in sdk.relationships:
+            assert from_id in uploaded_ids
+            assert to_id in uploaded_ids
+
+    def test_upload_carries_run_tags_and_metadata(self, tmp_path, atoms, fake_sdk):
+        config = DataeraiConfig(dry_run=False)
+
+        with track(directory=tmp_path, config=config, run_id="r7") as experiment:
+            experiment.capture_structure(atoms)
+
+        sdk = FakeSdkClient.instances[0]
+        for _, kwargs in sdk.uploads:
+            assert "abtem-dataerai" in kwargs["tags"]
+            assert "abtem-run:r7" in kwargs["tags"]
+            assert kwargs["metadata"]["run_id"] == "r7"
+            assert kwargs["metadata"]["abtem_version"] == abtem.__version__
+
+    def test_sdk_client_closed_after_finalize(self, tmp_path, atoms, fake_sdk):
+        config = DataeraiConfig(dry_run=False)
+
+        with track(directory=tmp_path, config=config, run_id="r1") as experiment:
+            experiment.capture_structure(atoms)
+
+        assert FakeSdkClient.instances[0].closed is True
+
+    def test_collection_files_uploads(self, tmp_path, atoms, fake_sdk):
+        config = DataeraiConfig(dry_run=False)
+
+        with track(
+            directory=tmp_path,
+            config=config,
+            run_id="r1",
+            collection="Microscopy/abTEM",
+        ) as experiment:
+            experiment.capture_structure(atoms)
+
+        manifest = read_manifest(tmp_path, "r1")
+        assert manifest["config"]["collection"] == "Microscopy/abTEM"
+        assert manifest["config"]["collection_status"] == "resolved"
+
+        sdk = FakeSdkClient.instances[0]
+        assert sdk.collection_paths == [("Microscopy/abTEM", True)]
+        for _, kwargs in sdk.uploads:
+            assert kwargs["collection_id"] == FakeDestination.collection_id
+            assert kwargs["owner_type"] == "project"
+            assert kwargs["owner_id"] == FakeDestination.project_id
+
+    def test_collection_from_config_env(self, tmp_path, atoms, fake_sdk):
+        config = DataeraiConfig(dry_run=False, collection="Env/Runs")
+
+        with track(directory=tmp_path, config=config, run_id="r1") as experiment:
+            experiment.capture_structure(atoms)
+
+        manifest = read_manifest(tmp_path, "r1")
+        assert manifest["config"]["collection"] == "Env/Runs"
+        assert FakeSdkClient.instances[0].collection_paths == [("Env/Runs", True)]
+
+    def test_collection_failure_still_uploads(self, tmp_path, atoms, fake_sdk):
+        FakeSdkClient.collection_error = RuntimeError("no such project")
+        config = DataeraiConfig(dry_run=False)
+
+        with track(
+            directory=tmp_path, config=config, run_id="r1", collection="X/Y"
+        ) as experiment:
+            experiment.capture_structure(atoms)
+
+        manifest = read_manifest(tmp_path, "r1")
+        assert "no such project" in manifest["config"]["collection_status"]
+        for node in manifest["nodes"].values():
+            assert node["upload_status"] == "uploaded"
+        for _, kwargs in FakeSdkClient.instances[0].uploads:
+            assert kwargs.get("collection_id") is None
+
+    def test_dry_run_records_collection_without_resolving(self, tmp_path, atoms):
+        with track(
+            directory=tmp_path,
+            config=DataeraiConfig(dry_run=True, collection="A/B"),
+            run_id="r1",
+        ) as experiment:
+            experiment.capture_structure(atoms)
+
+        manifest = read_manifest(tmp_path, "r1")
+        assert manifest["config"]["collection"] == "A/B"
+        assert manifest["config"]["collection_status"] is None
+
+    def test_deferred_write_skipped(self, tmp_path, images, fake_sdk):
+        config = DataeraiConfig(dry_run=False)
+
+        with track(directory=tmp_path, config=config, run_id="r1"):
+            images.to_zarr(str(tmp_path / "deferred.zarr.zip"), compute=False)
+
+        manifest = read_manifest(tmp_path, "r1")
+        (node,) = nodes_with_role(manifest, "measurement").values()
+        assert node["upload_status"] == "skipped"
+        assert "missing" in node["upload_detail"]
+        # edges touching the unsaved node are skipped, not failed
+        edge_statuses = {
+            edge["link_status"]
+            for edge in manifest["edges"]
+            if edge["from"] == node_key(manifest, node)
+        }
+        assert edge_statuses <= {"skipped"}
+
+
+def node_key(manifest, node):
+    for key, candidate in manifest["nodes"].items():
+        if candidate is node:
+            return key
+    raise AssertionError("node not in manifest")
+
+
+class _FakeNotebookSession:
+    """Mirror of a tracing NotebookSession for the experiment layer."""
+
+    def __init__(self, collection_path="Microscopy/abTEM"):
+        self.collection_path = collection_path
+        self.project_id = "70000000-0000-0000-0000-000000000009"
+        self.collection_id = "80000000-0000-0000-0000-000000000008"
+        self.trace_run_id = "nb-run-1"
+        self.uploads = []
+        self.relationships = []
+
+    def upload(self, local_path, *, title, **kwargs):
+        for forbidden in ("owner_type", "owner_id", "collection_id"):
+            assert forbidden not in kwargs
+        self.uploads.append((local_path, title, kwargs))
+        return types.SimpleNamespace(asset_id=f"nb-asset-{len(self.uploads)}")
+
+    def create_relationship(self, from_asset_id, to_asset_id, rel_type, **kwargs):
+        self.relationships.append((from_asset_id, to_asset_id, rel_type, kwargs))
+        return types.SimpleNamespace(id="nb-rel", type=rel_type)
+
+
+class TestNotebookSessionUnification:
+    def test_uploads_and_links_route_through_session(
+        self, tmp_path, atoms, monkeypatch
+    ):
+        session = _FakeNotebookSession()
+        monkeypatch.setattr(
+            "abtem.dataerai._experiment.active_notebook_session", lambda: session
+        )
+        config = DataeraiConfig(dry_run=False)
+
+        with track(directory=tmp_path, config=config, run_id="r1") as experiment:
+            experiment.capture_structure(atoms)
+            experiment.capture_potential(abtem.Potential(atoms, sampling=0.2))
+            experiment.capture_measurement(
+                abtem.Images(np.ones((8, 8), dtype=np.float32), sampling=0.1),
+                name="m",
+            )
+
+        manifest = read_manifest(tmp_path, "r1")
+        assert (
+            manifest["config"]["collection_status"]
+            == "notebook-session:Microscopy/abTEM"
+        )
+        uploaded = [
+            node
+            for node in manifest["nodes"].values()
+            if node["upload_status"] == "uploaded"
+        ]
+        assert uploaded
+        assert all(node["asset_id"].startswith("nb-asset-") for node in uploaded)
+        assert len(session.uploads) == len(uploaded)
+
+        linked = [
+            edge for edge in manifest["edges"] if edge["link_status"] == "created"
+        ]
+        assert linked
+        assert len(session.relationships) == len(linked)
+
+    def test_conflicting_collection_bypasses_session(
+        self, tmp_path, atoms, monkeypatch, fake_sdk
+    ):
+        session = _FakeNotebookSession(collection_path="A/B")
+        monkeypatch.setattr(
+            "abtem.dataerai._experiment.active_notebook_session", lambda: session
+        )
+        config = DataeraiConfig(dry_run=False)
+
+        with track(
+            directory=tmp_path, config=config, run_id="r1", collection="C/D"
+        ) as experiment:
+            experiment.capture_structure(atoms)
+
+        # session left untouched; the direct SDK client was used instead
+        assert session.uploads == []
+        assert FakeSdkClient.instances
+
+    def test_no_session_uses_direct_client(
+        self, tmp_path, atoms, monkeypatch, fake_sdk
+    ):
+        monkeypatch.setattr(
+            "abtem.dataerai._experiment.active_notebook_session", lambda: None
+        )
+        config = DataeraiConfig(dry_run=False)
+
+        with track(directory=tmp_path, config=config, run_id="r1") as experiment:
+            experiment.capture_structure(atoms)
+
+        manifest = read_manifest(tmp_path, "r1")
+        assert manifest["config"]["collection_status"] is None
+        assert FakeSdkClient.instances
+
+
+class TestStartFinishRun:
+    def test_start_run_activates(self, tmp_path):
+        exp = start_run(directory=tmp_path, config=DRY, run_id="r1")
+        try:
+            assert current_experiment() is exp
+        finally:
+            finish_run()
+        assert current_experiment() is None
+
+    def test_finish_run_writes_manifest(self, tmp_path, atoms):
+        exp = start_run(directory=tmp_path, config=DRY, run_id="r1")
+        exp.capture_structure(atoms)
+        result = finish_run()
+
+        assert result is exp
+        manifest = read_manifest(tmp_path, "r1")
+        assert manifest["status"] == "completed"
+        assert current_experiment() is None
+
+    def test_finish_run_without_active_returns_none(self):
+        assert finish_run() is None
+
+    def test_double_start_raises(self, tmp_path):
+        start_run(directory=tmp_path, config=DRY, run_id="r1")
+        try:
+            with pytest.raises(RuntimeError, match="already active"):
+                start_run(directory=tmp_path, config=DRY, run_id="r2")
+        finally:
+            finish_run()
+
+    def test_finish_run_failed_status(self, tmp_path):
+        start_run(directory=tmp_path, config=DRY, run_id="r1")
+        finish_run(status="failed")
+
+        manifest = read_manifest(tmp_path, "r1")
+        assert manifest["status"] == "failed"
+
+    def test_start_run_installs_autocapture(self, tmp_path, images):
+        start_run(directory=tmp_path, config=DRY, run_id="r1")
+        try:
+            images.to_zarr(str(tmp_path / "auto.zarr.zip"))
+        finally:
+            finish_run()
+
+        manifest = read_manifest(tmp_path, "r1")
+        measurements = [
+            node
+            for node in manifest["nodes"].values()
+            if node["role"] == "measurement"
+        ]
+        assert len(measurements) == 1
